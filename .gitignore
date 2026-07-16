@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# SQLite
+data/
+
 # Distribution / packaging
 .Python
 build/
