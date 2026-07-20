@@ -8,8 +8,11 @@ from database import (
     count_saved_messages,
     delete_saved_message,
     get_saved_messages,
+    ignore_user,
     initialize_database,
+    is_user_ignored,
     save_unread_message,
+    unignore_user,
     update_saved_message_status,
 )
 
@@ -43,6 +46,19 @@ async def save_as_unread(
     interaction: discord.Interaction,
     message: discord.Message,
 ) -> None:
+    if await is_user_ignored(
+        saved_by_user_id=str(interaction.user.id),
+        ignored_user_id=str(message.author.id),
+    ):
+        await interaction.response.send_message(
+            (
+                f"Message not saved because you are ignoring "
+                f"messages from {message.author.mention}."
+            ),
+            ephemeral=True,
+        )
+        return
+
     guild_id = str(message.guild.id) if message.guild else None
 
     was_inserted = await save_unread_message(
@@ -61,6 +77,60 @@ async def save_as_unread(
         response = f"Saved as UNREAD: {message.jump_url}"
     else:
         response = "This message is already saved."
+
+    await interaction.response.send_message(
+        response,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="ignore_user",
+    description="Ignore a user's messages when saving",
+)
+@app_commands.describe(
+    user="Choose the user whose messages should be ignored",
+)
+async def ignore_user_messages(
+    interaction: discord.Interaction,
+    user: discord.User,
+) -> None:
+    was_added = await ignore_user(
+        saved_by_user_id=str(interaction.user.id),
+        ignored_user_id=str(user.id),
+    )
+
+    if was_added:
+        response = f"Messages from {user.mention} will now be ignored."
+    else:
+        response = f"Messages from {user.mention} are already ignored."
+
+    await interaction.response.send_message(
+        response,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="unignore_user",
+    description="Allow a user's messages to be saved again",
+)
+@app_commands.describe(
+    user="Choose the user whose messages should no longer be ignored",
+)
+async def unignore_user_messages(
+    interaction: discord.Interaction,
+    user: discord.User,
+) -> None:
+    was_removed = await unignore_user(
+        saved_by_user_id=str(interaction.user.id),
+        ignored_user_id=str(user.id),
+    )
+
+    if was_removed:
+        response = f"Messages from {user.mention} can now be saved again."
+    else:
+        response = f"Messages from {user.mention} were not being ignored."
 
     await interaction.response.send_message(
         response,

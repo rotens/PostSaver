@@ -33,12 +33,98 @@ CREATE TABLE IF NOT EXISTS saved_messages (
 """
 
 
+CREATE_IGNORED_USERS_TABLE = """
+CREATE TABLE IF NOT EXISTS ignored_users (
+    saved_by_user_id TEXT NOT NULL,
+    ignored_user_id TEXT NOT NULL,
+
+    PRIMARY KEY (saved_by_user_id, ignored_user_id)
+);
+"""
+
+
 async def initialize_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
         await database.execute(CREATE_SAVED_MESSAGES_TABLE)
+        await database.execute(CREATE_IGNORED_USERS_TABLE)
         await database.commit()
+
+
+async def ignore_user(
+    *,
+    saved_by_user_id: str,
+    ignored_user_id: str,
+) -> bool:
+    query = """
+    INSERT OR IGNORE INTO ignored_users (
+        saved_by_user_id,
+        ignored_user_id
+    )
+    VALUES (?, ?);
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                ignored_user_id,
+            ),
+        )
+        await database.commit()
+
+        return cursor.rowcount == 1
+
+
+async def unignore_user(
+    *,
+    saved_by_user_id: str,
+    ignored_user_id: str,
+) -> bool:
+    query = """
+    DELETE FROM ignored_users
+    WHERE saved_by_user_id = ?
+      AND ignored_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                ignored_user_id,
+            ),
+        )
+        await database.commit()
+
+        return cursor.rowcount == 1
+
+
+async def is_user_ignored(
+    *,
+    saved_by_user_id: str,
+    ignored_user_id: str,
+) -> bool:
+    query = """
+    SELECT 1
+    FROM ignored_users
+    WHERE saved_by_user_id = ?
+      AND ignored_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                ignored_user_id,
+            ),
+        )
+        row = await cursor.fetchone()
+
+        return row is not None
 
 
 async def save_unread_message(
