@@ -12,6 +12,7 @@ from database import (
     initialize_database,
     is_user_ignored,
     save_unread_message,
+    unignore_all_users,
     unignore_user,
     update_saved_message_status,
 )
@@ -84,16 +85,9 @@ async def save_as_unread(
     )
 
 
-@bot.tree.command(
-    name="ignore_user",
-    description="Ignore a user's messages when saving",
-)
-@app_commands.describe(
-    user="Choose the user whose messages should be ignored",
-)
-async def ignore_user_messages(
+async def respond_to_ignore_user(
     interaction: discord.Interaction,
-    user: discord.User,
+    user: discord.User | discord.Member,
 ) -> None:
     was_added = await ignore_user(
         saved_by_user_id=str(interaction.user.id),
@@ -111,16 +105,9 @@ async def ignore_user_messages(
     )
 
 
-@bot.tree.command(
-    name="unignore_user",
-    description="Allow a user's messages to be saved again",
-)
-@app_commands.describe(
-    user="Choose the user whose messages should no longer be ignored",
-)
-async def unignore_user_messages(
+async def respond_to_unignore_user(
     interaction: discord.Interaction,
-    user: discord.User,
+    user: discord.User | discord.Member,
 ) -> None:
     was_removed = await unignore_user(
         saved_by_user_id=str(interaction.user.id),
@@ -136,6 +123,92 @@ async def unignore_user_messages(
         response,
         ephemeral=True,
     )
+
+
+@bot.tree.command(
+    name="ignore_user",
+    description="Ignore a user's messages when saving",
+)
+@app_commands.describe(
+    user="Choose the user whose messages should be ignored",
+)
+async def ignore_user_messages(
+    interaction: discord.Interaction,
+    user: discord.User,
+) -> None:
+    await respond_to_ignore_user(interaction, user)
+
+
+@bot.tree.command(
+    name="unignore_user",
+    description="Allow a user's messages to be saved again",
+)
+@app_commands.describe(
+    user="Choose the user whose messages should no longer be ignored",
+)
+async def unignore_user_messages(
+    interaction: discord.Interaction,
+    user: discord.User,
+) -> None:
+    await respond_to_unignore_user(interaction, user)
+
+
+@bot.tree.command(
+    name="unignore_all",
+    description="Stop ignoring messages from all users",
+)
+async def unignore_all_user_messages(
+    interaction: discord.Interaction,
+) -> None:
+    removed_count = await unignore_all_users(
+        saved_by_user_id=str(interaction.user.id),
+    )
+
+    if removed_count == 0:
+        response = "Your ignore settings were already at the default."
+    else:
+        user_label = "user" if removed_count == 1 else "users"
+        response = (
+            f"Reset your ignore settings for "
+            f"{removed_count} {user_label}."
+        )
+
+    await interaction.response.send_message(
+        response,
+        ephemeral=True,
+    )
+
+
+@bot.tree.context_menu(name="Ignore user's messages")
+async def ignore_user_context_menu(
+    interaction: discord.Interaction,
+    user: discord.User,
+) -> None:
+    await respond_to_ignore_user(interaction, user)
+
+
+@bot.tree.context_menu(name="Unignore user's messages")
+async def unignore_user_context_menu(
+    interaction: discord.Interaction,
+    user: discord.User,
+) -> None:
+    await respond_to_unignore_user(interaction, user)
+
+
+@bot.tree.context_menu(name="Ignore message author")
+async def ignore_message_author_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    await respond_to_ignore_user(interaction, message.author)
+
+
+@bot.tree.context_menu(name="Unignore message author")
+async def unignore_message_author_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    await respond_to_unignore_user(interaction, message.author)
 
 
 class SavedMessageView(discord.ui.View):

@@ -102,6 +102,25 @@ async def unignore_user(
         return cursor.rowcount == 1
 
 
+async def unignore_all_users(
+    *,
+    saved_by_user_id: str,
+) -> int:
+    query = """
+    DELETE FROM ignored_users
+    WHERE saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (saved_by_user_id,),
+        )
+        await database.commit()
+
+        return cursor.rowcount
+
+
 async def is_user_ignored(
     *,
     saved_by_user_id: str,
