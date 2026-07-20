@@ -5,6 +5,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from database import (
+    count_saved_messages,
     delete_saved_message,
     get_saved_messages,
     initialize_database,
@@ -14,6 +15,9 @@ from database import (
 
 
 load_dotenv()
+
+
+SAVED_MESSAGES_PAGE_SIZE = 5
 
 
 class ReadingBot(discord.Client):
@@ -72,12 +76,16 @@ class SavedMessageView(discord.ui.View):
         owner_user_id: int,
         jump_url: str,
         current_status: str,
+        page_number: int,
+        total_pages: int,
     ) -> None:
         super().__init__(timeout=600)
 
         self.record_id = record_id
         self.owner_user_id = owner_user_id
         self.current_status = current_status
+        self.page_number = page_number
+        self.total_pages = total_pages
 
         open_button = discord.ui.Button(
             label="Open message",
@@ -137,7 +145,12 @@ class SavedMessageView(discord.ui.View):
         self.refresh_buttons()
 
         embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"Status: {status}")
+        embed.set_footer(
+            text=(
+                f"Status: {status} | "
+                f"Page {self.page_number}/{self.total_pages}"
+            ),
+        )
 
         await interaction.response.edit_message(
             embed=embed,
@@ -203,6 +216,7 @@ class SavedMessageView(discord.ui.View):
 )
 @app_commands.describe(
     status="Choose which message status to show",
+    page="Choose which page to show",
 )
 @app_commands.choices(
     status=[
@@ -223,6 +237,7 @@ class SavedMessageView(discord.ui.View):
 async def show_saved_messages(
     interaction: discord.Interaction,
     status: app_commands.Choice[str] | None = None,
+    page: app_commands.Range[int, 1] = 1,
 ) -> None:
     
     print("/saved handler started")
@@ -233,12 +248,12 @@ async def show_saved_messages(
 
     await interaction.response.defer(ephemeral=True)
 
-    rows = await get_saved_messages(
+    total_records = await count_saved_messages(
         saved_by_user_id=str(interaction.user.id),
         status=selected_status,
     )
 
-    if not rows:
+    if total_records == 0:
         await interaction.edit_original_response(
             content=(
                 f"You have no saved messages "
@@ -246,6 +261,27 @@ async def show_saved_messages(
             ),
         )
         return
+
+    total_pages = (
+        total_records + SAVED_MESSAGES_PAGE_SIZE - 1
+    ) // SAVED_MESSAGES_PAGE_SIZE
+
+    if page > total_pages:
+        await interaction.edit_original_response(
+            content=(
+                f"Page `{page}` does not exist. "
+                f"You have {total_pages} page(s) "
+                f"with status `{selected_status}`."
+            ),
+        )
+        return
+
+    rows = await get_saved_messages(
+        saved_by_user_id=str(interaction.user.id),
+        status=selected_status,
+        limit=SAVED_MESSAGES_PAGE_SIZE,
+        offset=(page - 1) * SAVED_MESSAGES_PAGE_SIZE,
+    )
 
     for index, row in enumerate(rows):
         content = row["content"].strip()
@@ -268,7 +304,10 @@ async def show_saved_messages(
         )
 
         embed.set_footer(
-            text=f'Status: {row["status"]}',
+            text=(
+                f'Status: {row["status"]} | '
+                f"Page {page}/{total_pages}"
+            ),
         )
 
         view = SavedMessageView(
@@ -276,6 +315,8 @@ async def show_saved_messages(
             owner_user_id=interaction.user.id,
             jump_url=row["jump_url"],
             current_status=row["status"],
+            page_number=page,
+            total_pages=total_pages,
         )
 
         if index == 0:

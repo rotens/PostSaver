@@ -93,6 +93,7 @@ async def get_saved_messages(
     saved_by_user_id: str,
     status: str = "UNREAD",
     limit: int = 10,
+    offset: int = 0,
 ) -> list[aiosqlite.Row]:
     query = """
     SELECT
@@ -113,11 +114,12 @@ async def get_saved_messages(
         values.append(status)
 
     query += """
-    ORDER BY saved_at DESC
-    LIMIT ?
+    ORDER BY saved_at DESC, id DESC
+    LIMIT ? OFFSET ?
     """
 
     values.append(limit)
+    values.append(offset)
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
         database.row_factory = aiosqlite.Row
@@ -126,6 +128,30 @@ async def get_saved_messages(
         rows = await cursor.fetchall()
 
         return rows
+
+
+async def count_saved_messages(
+    *,
+    saved_by_user_id: str,
+    status: str = "UNREAD",
+) -> int:
+    query = """
+    SELECT COUNT(*)
+    FROM saved_messages
+    WHERE saved_by_user_id = ?
+    """
+
+    values = [saved_by_user_id]
+
+    if status != "ALL":
+        query += " AND status = ?"
+        values.append(status)
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(query, values)
+        row = await cursor.fetchone()
+
+        return row[0]
     
 
 VALID_STATUSES = {"UNREAD", "READ_KEEP"}
