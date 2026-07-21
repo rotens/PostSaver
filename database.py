@@ -43,13 +43,105 @@ CREATE TABLE IF NOT EXISTS ignored_users (
 """
 
 
+CREATE_PENDING_RANGES_TABLE = """
+CREATE TABLE IF NOT EXISTS pending_ranges (
+    saved_by_user_id TEXT PRIMARY KEY,
+    guild_id TEXT,
+    channel_id TEXT NOT NULL,
+    start_message_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
 async def initialize_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
         await database.execute(CREATE_SAVED_MESSAGES_TABLE)
         await database.execute(CREATE_IGNORED_USERS_TABLE)
+        await database.execute(CREATE_PENDING_RANGES_TABLE)
         await database.commit()
+
+
+async def set_pending_range_start(
+    *,
+    saved_by_user_id: str,
+    guild_id: str | None,
+    channel_id: str,
+    start_message_id: str,
+) -> None:
+    query = """
+    INSERT INTO pending_ranges (
+        saved_by_user_id,
+        guild_id,
+        channel_id,
+        start_message_id
+    )
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(saved_by_user_id) DO UPDATE SET
+        guild_id = excluded.guild_id,
+        channel_id = excluded.channel_id,
+        start_message_id = excluded.start_message_id,
+        created_at = CURRENT_TIMESTAMP;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                guild_id,
+                channel_id,
+                start_message_id,
+            ),
+        )
+        await database.commit()
+
+
+async def get_pending_range(
+    *,
+    saved_by_user_id: str,
+) -> aiosqlite.Row | None:
+    query = """
+    SELECT
+        saved_by_user_id,
+        guild_id,
+        channel_id,
+        start_message_id,
+        created_at
+    FROM pending_ranges
+    WHERE saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+
+        cursor = await database.execute(
+            query,
+            (saved_by_user_id,),
+        )
+
+        return await cursor.fetchone()
+
+
+async def delete_pending_range(
+    *,
+    saved_by_user_id: str,
+) -> bool:
+    query = """
+    DELETE FROM pending_ranges
+    WHERE saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (saved_by_user_id,),
+        )
+        await database.commit()
+
+        return cursor.rowcount == 1
 
 
 async def ignore_user(

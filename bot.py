@@ -12,6 +12,7 @@ from database import (
     initialize_database,
     is_user_ignored,
     save_unread_message,
+    set_pending_range_start,
     unignore_all_users,
     unignore_user,
     update_saved_message_status,
@@ -209,6 +210,29 @@ async def unignore_message_author_context_menu(
     message: discord.Message,
 ) -> None:
     await respond_to_unignore_user(interaction, message.author)
+
+
+@bot.tree.context_menu(name="Set range start")
+async def set_range_start_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    guild_id = str(message.guild.id) if message.guild else None
+
+    await set_pending_range_start(
+        saved_by_user_id=str(interaction.user.id),
+        guild_id=guild_id,
+        channel_id=str(message.channel.id),
+        start_message_id=str(message.id),
+    )
+
+    await interaction.response.send_message(
+        (
+            f"Range start set: {message.jump_url}\n"
+            "Selecting another start will replace this one."
+        ),
+        ephemeral=True,
+    )
 
 
 class SavedMessageView(discord.ui.View):
