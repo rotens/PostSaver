@@ -54,13 +54,52 @@ CREATE TABLE IF NOT EXISTS pending_ranges (
 """
 
 
+CREATE_SAVED_BATCHES_TABLE = """
+CREATE TABLE IF NOT EXISTS saved_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    saved_by_user_id TEXT NOT NULL,
+    title TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+CREATE_SAVED_BATCH_MESSAGES_TABLE = """
+CREATE TABLE IF NOT EXISTS saved_batch_messages (
+    batch_id INTEGER NOT NULL,
+    saved_message_id INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+
+    PRIMARY KEY (batch_id, saved_message_id),
+    UNIQUE (batch_id, position),
+
+    FOREIGN KEY (batch_id)
+        REFERENCES saved_batches(id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (saved_message_id)
+        REFERENCES saved_messages(id)
+        ON DELETE CASCADE
+);
+"""
+
+
+CREATE_SAVED_BATCH_MESSAGE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_saved_batch_messages_saved_message_id
+ON saved_batch_messages (saved_message_id);
+"""
+
+
 async def initialize_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
         await database.execute(CREATE_SAVED_MESSAGES_TABLE)
         await database.execute(CREATE_IGNORED_USERS_TABLE)
         await database.execute(CREATE_PENDING_RANGES_TABLE)
+        await database.execute(CREATE_SAVED_BATCHES_TABLE)
+        await database.execute(CREATE_SAVED_BATCH_MESSAGES_TABLE)
+        await database.execute(CREATE_SAVED_BATCH_MESSAGE_INDEX)
         await database.commit()
 
 
@@ -142,6 +181,97 @@ async def delete_pending_range(
         await database.commit()
 
         return cursor.rowcount == 1
+
+
+async def create_saved_batch(
+    *,
+    saved_by_user_id: str,
+    title: str | None = None,
+) -> int:
+    query = """
+    INSERT INTO saved_batches (
+        saved_by_user_id,
+        title
+    )
+    VALUES (?, ?);
+    """
+
+    normalized_title = title.strip() if title else None
+
+    if not normalized_title:
+        normalized_title = None
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                normalized_title,
+            ),
+        )
+        await database.commit()
+
+        batch_id = cursor.lastrowid
+
+        if batch_id is None:
+            raise RuntimeError("Failed to create saved batch")
+
+        return batch_id
+
+
+async def associate_saved_messages_with_batch(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+    message_positions: list[tuple[int, int]],
+) -> int:
+    query = """
+    INSERT OR IGNORE INTO saved_batch_messages (
+        batch_id,
+        saved_message_id,
+        position
+    )
+    SELECT ?, ?, ?
+    WHERE EXISTS (
+        SELECT 1
+        FROM saved_batches
+        WHERE id = ?
+          AND saved_by_user_id = ?
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM saved_messages
+        WHERE id = ?
+          AND saved_by_user_id = ?
+    );
+    """
+
+    if any(position < 0 for _, position in message_positions):
+        raise ValueError("Batch message positions cannot be negative")
+
+    associated_count = 0
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        for saved_message_id, position in message_positions:
+            cursor = await database.execute(
+                query,
+                (
+                    batch_id,
+                    saved_message_id,
+                    position,
+                    batch_id,
+                    saved_by_user_id,
+                    saved_message_id,
+                    saved_by_user_id,
+                ),
+            )
+            associated_count += cursor.rowcount
+
+        await database.commit()
+
+    return associated_count
 
 
 async def ignore_user(
@@ -396,6 +526,7 @@ async def delete_saved_message(
     """
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
         cursor = await database.execute(
             query,
             (
