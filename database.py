@@ -323,6 +323,162 @@ async def associate_saved_messages_with_batch(
     return associated_count
 
 
+async def count_saved_batches(
+    *,
+    saved_by_user_id: str,
+) -> int:
+    query = """
+    SELECT COUNT(*)
+    FROM saved_batches
+    WHERE saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (saved_by_user_id,),
+        )
+        row = await cursor.fetchone()
+
+        return row[0]
+
+
+async def get_saved_batches(
+    *,
+    saved_by_user_id: str,
+    limit: int = 5,
+    offset: int = 0,
+) -> list[aiosqlite.Row]:
+    query = """
+    WITH batch_stats AS (
+        SELECT
+            batch_messages.batch_id,
+            COUNT(*) AS message_count,
+            MIN(batch_messages.position) AS first_position
+        FROM saved_batch_messages AS batch_messages
+        JOIN saved_batches AS owned_batch
+          ON owned_batch.id = batch_messages.batch_id
+        JOIN saved_messages AS saved_message
+          ON saved_message.id = batch_messages.saved_message_id
+         AND saved_message.saved_by_user_id = owned_batch.saved_by_user_id
+        WHERE owned_batch.saved_by_user_id = ?
+        GROUP BY batch_messages.batch_id
+    )
+    SELECT
+        saved_batch.id,
+        saved_batch.title,
+        saved_batch.created_at,
+        COALESCE(batch_stats.message_count, 0) AS message_count,
+        first_message.id AS first_message_record_id,
+        first_message.author_name AS first_message_author_name,
+        first_message.content AS first_message_content,
+        first_message.jump_url AS first_message_jump_url,
+        first_message.message_created_at AS first_message_created_at,
+        first_message.status AS first_message_status
+    FROM saved_batches AS saved_batch
+    LEFT JOIN batch_stats
+      ON batch_stats.batch_id = saved_batch.id
+    LEFT JOIN saved_batch_messages AS first_batch_message
+      ON first_batch_message.batch_id = saved_batch.id
+     AND first_batch_message.position = batch_stats.first_position
+    LEFT JOIN saved_messages AS first_message
+      ON first_message.id = first_batch_message.saved_message_id
+     AND first_message.saved_by_user_id = saved_batch.saved_by_user_id
+    WHERE saved_batch.saved_by_user_id = ?
+    ORDER BY saved_batch.created_at DESC, saved_batch.id DESC
+    LIMIT ? OFFSET ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                saved_by_user_id,
+                limit,
+                offset,
+            ),
+        )
+
+        return await cursor.fetchall()
+
+
+async def count_saved_messages_in_batch(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+) -> int:
+    query = """
+    SELECT COUNT(*)
+    FROM saved_batches AS saved_batch
+    JOIN saved_batch_messages AS batch_message
+      ON batch_message.batch_id = saved_batch.id
+    JOIN saved_messages AS saved_message
+      ON saved_message.id = batch_message.saved_message_id
+     AND saved_message.saved_by_user_id = saved_batch.saved_by_user_id
+    WHERE saved_batch.id = ?
+      AND saved_batch.saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (
+                batch_id,
+                saved_by_user_id,
+            ),
+        )
+        row = await cursor.fetchone()
+
+        return row[0]
+
+
+async def get_saved_messages_in_batch(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+    limit: int = 5,
+    offset: int = 0,
+) -> list[aiosqlite.Row]:
+    query = """
+    SELECT
+        saved_message.id,
+        saved_message.author_name,
+        saved_message.content,
+        saved_message.jump_url,
+        saved_message.message_created_at,
+        saved_message.status,
+        batch_message.position
+    FROM saved_batches AS saved_batch
+    JOIN saved_batch_messages AS batch_message
+      ON batch_message.batch_id = saved_batch.id
+    JOIN saved_messages AS saved_message
+      ON saved_message.id = batch_message.saved_message_id
+     AND saved_message.saved_by_user_id = saved_batch.saved_by_user_id
+    WHERE saved_batch.id = ?
+      AND saved_batch.saved_by_user_id = ?
+    ORDER BY batch_message.position ASC
+    LIMIT ? OFFSET ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+
+        cursor = await database.execute(
+            query,
+            (
+                batch_id,
+                saved_by_user_id,
+                limit,
+                offset,
+            ),
+        )
+
+        return await cursor.fetchall()
+
+
 async def save_message_range_as_batch(
     *,
     saved_by_user_id: str,

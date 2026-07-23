@@ -228,7 +228,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 69 tests covering:
+The current suite contains 75 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
 - saved-message status validation, ownership, and deletion;
@@ -237,7 +237,8 @@ The current suite contains 69 tests covering:
 - saved-message view ownership, button states, status changes, and deletion;
 - `/saved` filtering, page calculation, empty results, and panel rendering;
 - pending-range creation, replacement, isolation, and deletion;
-- batch creation, ownership, ordering, and associations;
+- batch creation, ownership, ordering, associations, summaries, and
+  paginated contents;
 - inclusive and reverse-direction history retrieval;
 - the 1,000-message scan limit and 300-message saved-message limit;
 - ignored-author filtering;
