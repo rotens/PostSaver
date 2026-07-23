@@ -113,6 +113,44 @@ class RangeSavingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(pending_range)
 
+    async def test_range_save_rejects_invalid_message_collections(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "empty"):
+            await database.save_message_range_as_batch(
+                saved_by_user_id="user-1",
+                expected_start_message_id="message-1",
+                title=None,
+                messages=[],
+            )
+
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            await database.save_message_range_as_batch(
+                saved_by_user_id="user-1",
+                expected_start_message_id="message-1",
+                title=None,
+                messages=[self.message("message-1", -1)],
+            )
+
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            await database.save_message_range_as_batch(
+                saved_by_user_id="user-1",
+                expected_start_message_id="message-1",
+                title=None,
+                messages=[
+                    self.message("message-1", 0),
+                    self.message("message-2", 0),
+                ],
+            )
+
+        batches = await self.fetch_all("SELECT id FROM saved_batches;")
+        saved_messages = await self.fetch_all(
+            "SELECT id FROM saved_messages;"
+        )
+
+        self.assertEqual(batches, [])
+        self.assertEqual(saved_messages, [])
+
     async def test_existing_read_keep_message_is_reused_without_resetting_status(
         self,
     ) -> None:

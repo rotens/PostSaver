@@ -225,8 +225,14 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 29 tests covering:
+The current suite contains 67 tests covering:
 
+- individual-message storage, duplicate handling, ordering, and pagination;
+- saved-message status validation, ownership, and deletion;
+- ignored-user creation, removal, reset, self-ignore, and owner isolation;
+- Discord command responses and metadata passed to the database layer;
+- saved-message view ownership, button states, status changes, and deletion;
+- `/saved` filtering, page calculation, empty results, and panel rendering;
 - pending-range creation, replacement, isolation, and deletion;
 - batch creation, ownership, ordering, and associations;
 - inclusive and reverse-direction history retrieval;
@@ -234,7 +240,7 @@ The current suite contains 29 tests covering:
 - ignored-author filtering;
 - duplicate and `READ_KEEP` handling;
 - atomic range saving and rollback;
-- stale range protection and pending-range cleanup;
+- stale range protection, validation failures, and pending-range cleanup;
 - optional-title and modal response behavior.
 
 Manual Discord testing has also confirmed the current range-saving workflow.

@@ -71,7 +71,10 @@ class FakeMessage:
 class FakeInteraction:
     def __init__(self, user_id: int = 42) -> None:
         self.user = SimpleNamespace(id=user_id)
-        self.response = SimpleNamespace(defer=AsyncMock())
+        self.response = SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+        )
         self.edited_content = []
 
     async def edit_original_response(self, *, content: str) -> None:
@@ -79,6 +82,17 @@ class FakeInteraction:
 
 
 class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_positive_maximum_is_rejected(self) -> None:
+        channel = FakeChannel(20)
+        message = FakeMessage(100, channel=channel, author_id=1)
+
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            await bot.get_messages_in_range(
+                message,
+                message,
+                max_messages=0,
+            )
+
     async def test_history_is_inclusive_and_oldest_first(self) -> None:
         channel = FakeChannel(20)
         start = FakeMessage(100, channel=channel, author_id=1)
@@ -137,6 +151,163 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deleted_start_clears_only_matching_pending_range(
+        self,
+    ) -> None:
+        channel = FakeChannel(20)
+        end = FakeMessage(300, channel=channel, author_id=3)
+        interaction = FakeInteraction()
+        not_found = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"),
+            {
+                "code": 10008,
+                "message": "Unknown Message",
+            },
+        )
+        channel.fetch_message = AsyncMock(side_effect=not_found)
+
+        with (
+            patch.object(
+                bot,
+                "get_pending_range",
+                new=AsyncMock(
+                    return_value={
+                        "guild_id": "10",
+                        "channel_id": "20",
+                        "start_message_id": "100",
+                    }
+                ),
+            ),
+            patch.object(
+                bot,
+                "delete_pending_range_if_matches",
+                new=AsyncMock(return_value=True),
+            ) as delete_pending,
+            patch.object(
+                bot,
+                "save_message_range_as_batch",
+                new=AsyncMock(),
+            ) as save_range,
+        ):
+            await bot.complete_message_range(
+                interaction=interaction,
+                end_message=end,
+                expected_start_message_id="100",
+                batch_title="Deleted start",
+            )
+
+        delete_pending.assert_awaited_once_with(
+            saved_by_user_id="42",
+            expected_start_message_id="100",
+        )
+        save_range.assert_not_awaited()
+        self.assertIn(
+            "pending range was cleared",
+            interaction.edited_content[0],
+        )
+
+    async def test_oversized_range_keeps_pending_range_without_saving(
+        self,
+    ) -> None:
+        channel = FakeChannel(20)
+        end = FakeMessage(300, channel=channel, author_id=3)
+        channel.fetched_message = FakeMessage(
+            100,
+            channel=channel,
+            author_id=1,
+        )
+        interaction = FakeInteraction()
+
+        with (
+            patch.object(
+                bot,
+                "get_pending_range",
+                new=AsyncMock(
+                    return_value={
+                        "guild_id": "10",
+                        "channel_id": "20",
+                        "start_message_id": "100",
+                    }
+                ),
+            ),
+            patch.object(
+                bot,
+                "get_messages_in_range",
+                new=AsyncMock(side_effect=bot.RangeTooLargeError()),
+            ),
+            patch.object(
+                bot,
+                "delete_pending_range_if_matches",
+                new=AsyncMock(),
+            ) as delete_pending,
+            patch.object(
+                bot,
+                "save_message_range_as_batch",
+                new=AsyncMock(),
+            ) as save_range,
+        ):
+            await bot.complete_message_range(
+                interaction=interaction,
+                end_message=end,
+                expected_start_message_id="100",
+                batch_title="Too large",
+            )
+
+        delete_pending.assert_not_awaited()
+        save_range.assert_not_awaited()
+        self.assertIn(
+            "Nothing was saved and the pending range was kept",
+            interaction.edited_content[0],
+        )
+
+    async def test_atomic_save_detects_changed_pending_range(self) -> None:
+        channel = FakeChannel(20)
+        end = FakeMessage(100, channel=channel, author_id=1)
+        interaction = FakeInteraction()
+
+        with (
+            patch.object(
+                bot,
+                "get_pending_range",
+                new=AsyncMock(
+                    return_value={
+                        "guild_id": "10",
+                        "channel_id": "20",
+                        "start_message_id": "100",
+                    }
+                ),
+            ),
+            patch.object(
+                bot,
+                "get_ignored_user_ids",
+                new=AsyncMock(return_value=set()),
+            ),
+            patch.object(
+                bot,
+                "save_message_range_as_batch",
+                new=AsyncMock(
+                    side_effect=bot.PendingRangeChangedError()
+                ),
+            ),
+            patch.object(
+                bot,
+                "delete_pending_range_if_matches",
+                new=AsyncMock(),
+            ) as delete_pending,
+        ):
+            await bot.complete_message_range(
+                interaction=interaction,
+                end_message=end,
+                expected_start_message_id="100",
+                batch_title="Stale transaction",
+            )
+
+        delete_pending.assert_not_awaited()
+        self.assertIn(
+            "newer pending range was kept",
+            interaction.edited_content[0],
+        )
+
     async def test_filters_ignored_authors_saves_batch_and_reports_counts(
         self,
     ) -> None:
@@ -374,6 +545,30 @@ class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
             expected_start_message_id="100",
             batch_title="",
         )
+
+    async def test_modal_rejects_submission_from_another_user(self) -> None:
+        channel = FakeChannel(20)
+        message = FakeMessage(100, channel=channel, author_id=1)
+        interaction = FakeInteraction(user_id=99)
+        modal = bot.SaveRangeModal(
+            owner_user_id=42,
+            expected_start_message_id="100",
+            end_message=message,
+        )
+
+        with patch.object(
+            bot,
+            "complete_message_range",
+            new=AsyncMock(),
+        ) as complete_range:
+            await modal.on_submit(interaction)
+
+        interaction.response.defer.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once_with(
+            "This range form belongs to another user.",
+            ephemeral=True,
+        )
+        complete_range.assert_not_awaited()
 
 
 if __name__ == "__main__":
