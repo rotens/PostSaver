@@ -5,12 +5,18 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from database import (
+    MessageToSave,
+    PendingRangeChangedError,
     count_saved_messages,
+    delete_pending_range_if_matches,
     delete_saved_message,
+    get_ignored_user_ids,
+    get_pending_range,
     get_saved_messages,
     ignore_user,
     initialize_database,
     is_user_ignored,
+    save_message_range_as_batch,
     save_unread_message,
     set_pending_range_start,
     unignore_all_users,
@@ -23,11 +29,15 @@ load_dotenv()
 
 
 SAVED_MESSAGES_PAGE_SIZE = 5
+MAX_RANGE_MESSAGES = 100
 
 
 class ReadingBot(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.message_content = True
+
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
@@ -41,6 +51,281 @@ class ReadingBot(discord.Client):
 
 
 bot = ReadingBot()
+
+
+class RangeTooLargeError(ValueError):
+    pass
+
+
+async def get_messages_in_range(
+    start_message: discord.Message,
+    end_message: discord.Message,
+    *,
+    max_messages: int = MAX_RANGE_MESSAGES,
+) -> list[discord.Message]:
+    if max_messages < 1:
+        raise ValueError("The maximum range size must be at least one")
+
+    if start_message.id == end_message.id:
+        return [start_message]
+
+    if start_message.id < end_message.id:
+        older_message = start_message
+        newer_message = end_message
+    else:
+        older_message = end_message
+        newer_message = start_message
+
+    messages_between = [
+        message
+        async for message in end_message.channel.history(
+            limit=max_messages - 1,
+            after=discord.Object(id=older_message.id),
+            before=discord.Object(id=newer_message.id),
+            oldest_first=True,
+        )
+    ]
+
+    messages = [older_message, *messages_between, newer_message]
+
+    if len(messages) > max_messages:
+        raise RangeTooLargeError(
+            f"A message range cannot contain more than {max_messages} messages"
+        )
+
+    return messages
+
+
+def prepare_messages_to_save(
+    messages: list[discord.Message],
+) -> list[MessageToSave]:
+    return [
+        MessageToSave(
+            message_id=str(message.id),
+            guild_id=str(message.guild.id) if message.guild else None,
+            channel_id=str(message.channel.id),
+            author_id=str(message.author.id),
+            author_name=str(message.author),
+            content=message.content,
+            jump_url=message.jump_url,
+            message_created_at=message.created_at.isoformat(),
+            position=position,
+        )
+        for position, message in enumerate(messages)
+    ]
+
+
+async def complete_message_range(
+    *,
+    interaction: discord.Interaction,
+    end_message: discord.Message,
+    expected_start_message_id: str,
+    batch_title: str,
+) -> None:
+    saved_by_user_id = str(interaction.user.id)
+    pending_range = await get_pending_range(
+        saved_by_user_id=saved_by_user_id,
+    )
+
+    if (
+        pending_range is None
+        or pending_range["start_message_id"] != expected_start_message_id
+    ):
+        await interaction.edit_original_response(
+            content=(
+                "Your range start changed before this range was saved. "
+                "Open `Save through range end` again."
+            ),
+        )
+        return
+
+    end_guild_id = str(end_message.guild.id) if end_message.guild else None
+
+    if (
+        pending_range["guild_id"] != end_guild_id
+        or pending_range["channel_id"] != str(end_message.channel.id)
+    ):
+        await interaction.edit_original_response(
+            content="The range start and end must be in the same channel.",
+        )
+        return
+
+    if expected_start_message_id == str(end_message.id):
+        start_message = end_message
+    else:
+        try:
+            start_message = await end_message.channel.fetch_message(
+                int(expected_start_message_id)
+            )
+        except discord.NotFound:
+            was_cleared = await delete_pending_range_if_matches(
+                saved_by_user_id=saved_by_user_id,
+                expected_start_message_id=expected_start_message_id,
+            )
+            response = "The range-start message no longer exists."
+
+            if was_cleared:
+                response += " The pending range was cleared."
+
+            await interaction.edit_original_response(content=response)
+            return
+        except discord.Forbidden:
+            await interaction.edit_original_response(
+                content=(
+                    "I cannot access the range-start message. "
+                    "The pending range was kept."
+                ),
+            )
+            return
+        except discord.HTTPException:
+            await interaction.edit_original_response(
+                content=(
+                    "Discord could not provide the range-start message. "
+                    "Please try again; the pending range was kept."
+                ),
+            )
+            return
+
+    try:
+        messages_in_range = await get_messages_in_range(
+            start_message,
+            end_message,
+        )
+    except RangeTooLargeError:
+        await interaction.edit_original_response(
+            content=(
+                f"This range contains more than {MAX_RANGE_MESSAGES} messages. "
+                "Nothing was saved and the pending range was kept."
+            ),
+        )
+        return
+    except discord.Forbidden:
+        await interaction.edit_original_response(
+            content=(
+                "I cannot read this channel's message history. "
+                "Nothing was saved and the pending range was kept."
+            ),
+        )
+        return
+    except discord.HTTPException:
+        await interaction.edit_original_response(
+            content=(
+                "Discord could not provide the message history. "
+                "Please try again; the pending range was kept."
+            ),
+        )
+        return
+
+    ignored_user_ids = await get_ignored_user_ids(
+        saved_by_user_id=saved_by_user_id,
+    )
+    messages_to_save = [
+        message
+        for message in messages_in_range
+        if str(message.author.id) not in ignored_user_ids
+    ]
+    ignored_count = len(messages_in_range) - len(messages_to_save)
+
+    if not messages_to_save:
+        was_cleared = await delete_pending_range_if_matches(
+            saved_by_user_id=saved_by_user_id,
+            expected_start_message_id=expected_start_message_id,
+        )
+
+        if not was_cleared:
+            await interaction.edit_original_response(
+                content=(
+                    "Your range start changed before this range was completed. "
+                    "The newer pending range was kept."
+                ),
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=(
+                "Range completed.\n"
+                f"Messages in range: {len(messages_in_range)}\n"
+                "Saved: 0\n"
+                "Already saved: 0\n"
+                f"Ignored: {ignored_count}\n"
+                "No batch was created because every message was ignored."
+            ),
+        )
+        return
+
+    try:
+        result = await save_message_range_as_batch(
+            saved_by_user_id=saved_by_user_id,
+            expected_start_message_id=expected_start_message_id,
+            title=batch_title,
+            messages=prepare_messages_to_save(messages_to_save),
+        )
+    except PendingRangeChangedError:
+        await interaction.edit_original_response(
+            content=(
+                "Your range start changed before this range was saved. "
+                "The newer pending range was kept."
+            ),
+        )
+        return
+
+    normalized_title = batch_title.strip()
+
+    if normalized_title:
+        batch_label = discord.utils.escape_markdown(normalized_title)
+    else:
+        batch_label = f"Untitled batch #{result.batch_id}"
+
+    await interaction.edit_original_response(
+        content=(
+            "Range completed.\n"
+            f"Batch: {batch_label}\n"
+            f"Messages in range: {len(messages_in_range)}\n"
+            f"Saved: {result.saved_count}\n"
+            f"Already saved: {result.already_saved_count}\n"
+            f"Ignored: {ignored_count}"
+        ),
+    )
+
+
+class SaveRangeModal(discord.ui.Modal, title="Save message range"):
+    batch_title = discord.ui.TextInput(
+        label="Title",
+        placeholder="Optional title for this message range",
+        required=False,
+        max_length=100,
+    )
+
+    def __init__(
+        self,
+        *,
+        owner_user_id: int,
+        expected_start_message_id: str,
+        end_message: discord.Message,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.owner_user_id = owner_user_id
+        self.expected_start_message_id = expected_start_message_id
+        self.end_message = end_message
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message(
+                "This range form belongs to another user.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+        await complete_message_range(
+            interaction=interaction,
+            end_message=self.end_message,
+            expected_start_message_id=self.expected_start_message_id,
+            batch_title=self.batch_title.value,
+        )
 
 
 @bot.tree.context_menu(name="Save as UNREAD")
@@ -232,6 +517,43 @@ async def set_range_start_context_menu(
             "Selecting another start will replace this one."
         ),
         ephemeral=True,
+    )
+
+
+@bot.tree.context_menu(name="Save through range end")
+async def save_through_range_end_context_menu(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    pending_range = await get_pending_range(
+        saved_by_user_id=str(interaction.user.id),
+    )
+
+    if pending_range is None:
+        await interaction.response.send_message(
+            "Set a range start before selecting a range end.",
+            ephemeral=True,
+        )
+        return
+
+    guild_id = str(message.guild.id) if message.guild else None
+
+    if (
+        pending_range["guild_id"] != guild_id
+        or pending_range["channel_id"] != str(message.channel.id)
+    ):
+        await interaction.response.send_message(
+            "The range start and end must be in the same channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(
+        SaveRangeModal(
+            owner_user_id=interaction.user.id,
+            expected_start_message_id=pending_range["start_message_id"],
+            end_message=message,
+        )
     )
 
 

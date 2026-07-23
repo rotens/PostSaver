@@ -1,9 +1,34 @@
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiosqlite
 
 
 DATABASE_PATH = Path("data/reading_manager.db")
+
+
+@dataclass(frozen=True)
+class MessageToSave:
+    message_id: str
+    guild_id: str | None
+    channel_id: str
+    author_id: str
+    author_name: str
+    content: str
+    jump_url: str
+    message_created_at: str
+    position: int
+
+
+@dataclass(frozen=True)
+class RangeSaveResult:
+    batch_id: int
+    saved_count: int
+    already_saved_count: int
+
+
+class PendingRangeChangedError(RuntimeError):
+    pass
 
 
 CREATE_SAVED_MESSAGES_TABLE = """
@@ -183,6 +208,30 @@ async def delete_pending_range(
         return cursor.rowcount == 1
 
 
+async def delete_pending_range_if_matches(
+    *,
+    saved_by_user_id: str,
+    expected_start_message_id: str,
+) -> bool:
+    query = """
+    DELETE FROM pending_ranges
+    WHERE saved_by_user_id = ?
+      AND start_message_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                expected_start_message_id,
+            ),
+        )
+        await database.commit()
+
+        return cursor.rowcount == 1
+
+
 async def create_saved_batch(
     *,
     saved_by_user_id: str,
@@ -272,6 +321,178 @@ async def associate_saved_messages_with_batch(
         await database.commit()
 
     return associated_count
+
+
+async def save_message_range_as_batch(
+    *,
+    saved_by_user_id: str,
+    expected_start_message_id: str,
+    title: str | None,
+    messages: list[MessageToSave],
+) -> RangeSaveResult:
+    if not messages:
+        raise ValueError("Cannot create an empty saved batch")
+
+    positions = [message.position for message in messages]
+
+    if any(position < 0 for position in positions):
+        raise ValueError("Batch message positions cannot be negative")
+
+    if len(positions) != len(set(positions)):
+        raise ValueError("Batch message positions must be unique")
+
+    normalized_title = title.strip() if title else None
+
+    if not normalized_title:
+        normalized_title = None
+
+    check_pending_range_query = """
+    SELECT 1
+    FROM pending_ranges
+    WHERE saved_by_user_id = ?
+      AND start_message_id = ?;
+    """
+
+    create_batch_query = """
+    INSERT INTO saved_batches (
+        saved_by_user_id,
+        title
+    )
+    VALUES (?, ?);
+    """
+
+    save_message_query = """
+    INSERT OR IGNORE INTO saved_messages (
+        saved_by_user_id,
+        message_id,
+        guild_id,
+        channel_id,
+        author_id,
+        author_name,
+        content,
+        jump_url,
+        message_created_at,
+        status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
+    """
+
+    get_saved_message_id_query = """
+    SELECT id
+    FROM saved_messages
+    WHERE saved_by_user_id = ?
+      AND message_id = ?;
+    """
+
+    associate_message_query = """
+    INSERT INTO saved_batch_messages (
+        batch_id,
+        saved_message_id,
+        position
+    )
+    VALUES (?, ?, ?);
+    """
+
+    delete_pending_range_query = """
+    DELETE FROM pending_ranges
+    WHERE saved_by_user_id = ?
+      AND start_message_id = ?;
+    """
+
+    saved_count = 0
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        try:
+            await database.execute("BEGIN;")
+
+            cursor = await database.execute(
+                check_pending_range_query,
+                (
+                    saved_by_user_id,
+                    expected_start_message_id,
+                ),
+            )
+
+            if await cursor.fetchone() is None:
+                raise PendingRangeChangedError(
+                    "Pending range no longer matches the selected start"
+                )
+
+            cursor = await database.execute(
+                create_batch_query,
+                (
+                    saved_by_user_id,
+                    normalized_title,
+                ),
+            )
+            batch_id = cursor.lastrowid
+
+            if batch_id is None:
+                raise RuntimeError("Failed to create saved batch")
+
+            for message in messages:
+                cursor = await database.execute(
+                    save_message_query,
+                    (
+                        saved_by_user_id,
+                        message.message_id,
+                        message.guild_id,
+                        message.channel_id,
+                        message.author_id,
+                        message.author_name,
+                        message.content,
+                        message.jump_url,
+                        message.message_created_at,
+                    ),
+                )
+                saved_count += cursor.rowcount
+
+                cursor = await database.execute(
+                    get_saved_message_id_query,
+                    (
+                        saved_by_user_id,
+                        message.message_id,
+                    ),
+                )
+                row = await cursor.fetchone()
+
+                if row is None:
+                    raise RuntimeError("Failed to find saved message record")
+
+                await database.execute(
+                    associate_message_query,
+                    (
+                        batch_id,
+                        row[0],
+                        message.position,
+                    ),
+                )
+
+            cursor = await database.execute(
+                delete_pending_range_query,
+                (
+                    saved_by_user_id,
+                    expected_start_message_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise PendingRangeChangedError(
+                    "Pending range changed before completion"
+                )
+
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return RangeSaveResult(
+        batch_id=batch_id,
+        saved_count=saved_count,
+        already_saved_count=len(messages) - saved_count,
+    )
 
 
 async def ignore_user(
@@ -366,6 +587,26 @@ async def is_user_ignored(
         row = await cursor.fetchone()
 
         return row is not None
+
+
+async def get_ignored_user_ids(
+    *,
+    saved_by_user_id: str,
+) -> set[str]:
+    query = """
+    SELECT ignored_user_id
+    FROM ignored_users
+    WHERE saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        cursor = await database.execute(
+            query,
+            (saved_by_user_id,),
+        )
+        rows = await cursor.fetchall()
+
+        return {row[0] for row in rows}
 
 
 async def save_unread_message(
