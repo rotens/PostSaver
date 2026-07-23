@@ -29,7 +29,8 @@ load_dotenv()
 
 
 SAVED_MESSAGES_PAGE_SIZE = 5
-MAX_RANGE_MESSAGES = 100
+MAX_RANGE_MESSAGES_TO_SCAN = 1000
+MAX_SAVED_MESSAGES_PER_RANGE = 300
 
 
 class ReadingBot(discord.Client):
@@ -61,7 +62,7 @@ async def get_messages_in_range(
     start_message: discord.Message,
     end_message: discord.Message,
     *,
-    max_messages: int = MAX_RANGE_MESSAGES,
+    max_messages: int = MAX_RANGE_MESSAGES_TO_SCAN,
 ) -> list[discord.Message]:
     if max_messages < 1:
         raise ValueError("The maximum range size must be at least one")
@@ -194,7 +195,8 @@ async def complete_message_range(
     except RangeTooLargeError:
         await interaction.edit_original_response(
             content=(
-                f"This range contains more than {MAX_RANGE_MESSAGES} messages. "
+                "This range spans more than "
+                f"{MAX_RANGE_MESSAGES_TO_SCAN} Discord messages. "
                 "Nothing was saved and the pending range was kept."
             ),
         )
@@ -225,6 +227,17 @@ async def complete_message_range(
         if str(message.author.id) not in ignored_user_ids
     ]
     ignored_count = len(messages_in_range) - len(messages_to_save)
+
+    if len(messages_to_save) > MAX_SAVED_MESSAGES_PER_RANGE:
+        await interaction.edit_original_response(
+            content=(
+                f"This range contains {len(messages_to_save)} messages after "
+                "ignored authors are excluded. At most "
+                f"{MAX_SAVED_MESSAGES_PER_RANGE} messages can be saved in one "
+                "batch. Nothing was saved and the pending range was kept."
+            ),
+        )
+        return
 
     if not messages_to_save:
         was_cleared = await delete_pending_range_if_matches(

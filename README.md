@@ -65,9 +65,12 @@ Range behavior:
 - Both boundary messages are included.
 - Either selection direction is accepted; messages are stored oldest-first.
 - Start and end must belong to the same channel.
-- A range can contain at most 100 messages.
-- Oversized ranges are rejected without silently saving a partial range.
+- A selected range can span at most 1,000 Discord messages.
 - Ignored authors are excluded.
+- After ignored authors are excluded, at most 300 messages can be saved in one
+  batch.
+- Ranges exceeding either limit are rejected without silently saving a partial
+  range.
 - Existing saved records are associated with the batch without being
   duplicated.
 - Existing `READ_KEEP` records are not reset to `UNREAD`.
@@ -225,7 +228,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 67 tests covering:
+The current suite contains 69 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
 - saved-message status validation, ownership, and deletion;
@@ -236,7 +239,7 @@ The current suite contains 67 tests covering:
 - pending-range creation, replacement, isolation, and deletion;
 - batch creation, ownership, ordering, and associations;
 - inclusive and reverse-direction history retrieval;
-- the 100-message range limit;
+- the 1,000-message scan limit and 300-message saved-message limit;
 - ignored-author filtering;
 - duplicate and `READ_KEEP` handling;
 - atomic range saving and rollback;
@@ -274,7 +277,8 @@ data/reading_manager.db
 - Messages inside a batch do not yet have a dedicated batch-detail view.
 - Batch-level status changes are not implemented.
 - Persistent Discord views across bot restarts are not implemented.
-- The range size is currently fixed at 100 messages.
+- A selected range can currently span at most 1,000 Discord messages, and each
+  completed range can save at most 300 non-ignored messages.
 
 Planned work should continue in focused milestones and avoid unrelated
 refactoring.

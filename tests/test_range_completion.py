@@ -103,7 +103,10 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
         messages = await bot.get_messages_in_range(start, end)
 
         self.assertEqual(messages, [start, middle, end])
-        self.assertEqual(channel.history_arguments["limit"], 99)
+        self.assertEqual(
+            channel.history_arguments["limit"],
+            bot.MAX_RANGE_MESSAGES_TO_SCAN - 1,
+        )
         self.assertEqual(channel.history_arguments["after"].id, start.id)
         self.assertEqual(channel.history_arguments["before"].id, end.id)
         self.assertTrue(channel.history_arguments["oldest_first"])
@@ -373,6 +376,146 @@ class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Saved: 1", interaction.edited_content[0])
         self.assertIn("Already saved: 1", interaction.edited_content[0])
         self.assertIn("Ignored: 1", interaction.edited_content[0])
+
+    async def test_ignored_messages_do_not_consume_saved_message_limit(
+        self,
+    ) -> None:
+        channel = FakeChannel(20)
+        first = FakeMessage(100, channel=channel, author_id=1)
+        ignored = FakeMessage(200, channel=channel, author_id=2)
+        last = FakeMessage(300, channel=channel, author_id=3)
+        interaction = FakeInteraction()
+
+        with (
+            patch.object(
+                bot,
+                "MAX_SAVED_MESSAGES_PER_RANGE",
+                2,
+            ),
+            patch.object(
+                bot,
+                "get_pending_range",
+                new=AsyncMock(
+                    return_value={
+                        "guild_id": "10",
+                        "channel_id": "20",
+                        "start_message_id": "100",
+                    }
+                ),
+            ),
+            patch.object(
+                bot,
+                "get_messages_in_range",
+                new=AsyncMock(return_value=[first, ignored, last]),
+            ),
+            patch.object(
+                bot,
+                "get_ignored_user_ids",
+                new=AsyncMock(return_value={"2"}),
+            ),
+            patch.object(
+                bot,
+                "save_message_range_as_batch",
+                new=AsyncMock(
+                    return_value=RangeSaveResult(
+                        batch_id=7,
+                        saved_count=2,
+                        already_saved_count=0,
+                    )
+                ),
+            ) as save_range,
+        ):
+            await bot.complete_message_range(
+                interaction=interaction,
+                end_message=first,
+                expected_start_message_id="100",
+                batch_title="At saved limit",
+            )
+
+        prepared_messages = save_range.await_args.kwargs["messages"]
+
+        self.assertEqual(
+            [message.message_id for message in prepared_messages],
+            ["100", "300"],
+        )
+        self.assertEqual(
+            [message.position for message in prepared_messages],
+            [0, 1],
+        )
+        self.assertIn("Messages in range: 3", interaction.edited_content[0])
+        self.assertIn("Saved: 2", interaction.edited_content[0])
+        self.assertIn("Ignored: 1", interaction.edited_content[0])
+
+    async def test_too_many_non_ignored_messages_rejects_entire_range(
+        self,
+    ) -> None:
+        channel = FakeChannel(20)
+        messages = [
+            FakeMessage(100, channel=channel, author_id=1),
+            FakeMessage(200, channel=channel, author_id=2),
+            FakeMessage(300, channel=channel, author_id=3),
+        ]
+        interaction = FakeInteraction()
+
+        with (
+            patch.object(
+                bot,
+                "MAX_SAVED_MESSAGES_PER_RANGE",
+                2,
+            ),
+            patch.object(
+                bot,
+                "get_pending_range",
+                new=AsyncMock(
+                    return_value={
+                        "guild_id": "10",
+                        "channel_id": "20",
+                        "start_message_id": "100",
+                    }
+                ),
+            ),
+            patch.object(
+                bot,
+                "get_messages_in_range",
+                new=AsyncMock(return_value=messages),
+            ),
+            patch.object(
+                bot,
+                "get_ignored_user_ids",
+                new=AsyncMock(return_value=set()),
+            ),
+            patch.object(
+                bot,
+                "save_message_range_as_batch",
+                new=AsyncMock(),
+            ) as save_range,
+            patch.object(
+                bot,
+                "delete_pending_range_if_matches",
+                new=AsyncMock(),
+            ) as delete_pending,
+        ):
+            await bot.complete_message_range(
+                interaction=interaction,
+                end_message=messages[0],
+                expected_start_message_id="100",
+                batch_title="Over saved limit",
+            )
+
+        save_range.assert_not_awaited()
+        delete_pending.assert_not_awaited()
+        self.assertIn(
+            "contains 3 messages after ignored authors are excluded",
+            interaction.edited_content[0],
+        )
+        self.assertIn(
+            "At most 2 messages can be saved",
+            interaction.edited_content[0],
+        )
+        self.assertIn(
+            "Nothing was saved and the pending range was kept",
+            interaction.edited_content[0],
+        )
 
     async def test_all_ignored_clears_range_without_creating_batch(self) -> None:
         channel = FakeChannel(20)
