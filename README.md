@@ -175,6 +175,37 @@ On startup, the bot:
 
 The `data/` directory is ignored by Git.
 
+## Resetting test data
+
+Stop the bot before backing up, clearing, or restoring its database. The
+repository includes a helper for manual-test resets:
+
+```bash
+./db_backup_and_cleanup.sh backup-clear
+```
+
+The command creates and verifies a timestamped SQLite backup in
+`data/backups/` before clearing all five application tables. It also resets
+the autoincrement counters for saved messages and batches. Type `CLEAR` when
+prompted, or add `--yes` to intentionally skip the prompt.
+
+List the available backups:
+
+```bash
+./db_backup_and_cleanup.sh list
+```
+
+Restore one of them:
+
+```bash
+./db_backup_and_cleanup.sh restore data/backups/<backup-file>.db
+```
+
+Type `RESTORE` when prompted. Before replacing the live database, the script
+automatically creates another backup of its current contents. Both operations
+run SQLite integrity and schema checks; they leave the database structure in
+place and only replace or clear its data.
+
 ## Discord commands and interactions
 
 ### Slash commands
