@@ -7,11 +7,13 @@ from dotenv import load_dotenv
 from database import (
     MessageToSave,
     PendingRangeChangedError,
+    count_saved_batches,
     count_saved_messages,
     delete_pending_range_if_matches,
     delete_saved_message,
     get_ignored_user_ids,
     get_pending_range,
+    get_saved_batches,
     get_saved_messages,
     ignore_user,
     initialize_database,
@@ -29,6 +31,8 @@ load_dotenv()
 
 
 SAVED_MESSAGES_PAGE_SIZE = 5
+SAVED_BATCHES_PAGE_SIZE = 5
+BATCH_PREVIEW_CONTENT_LIMIT = 700
 MAX_RANGE_MESSAGES_TO_SCAN = 1000
 MAX_SAVED_MESSAGES_PER_RANGE = 300
 
@@ -710,6 +714,110 @@ class SavedMessageView(discord.ui.View):
             embed=None,
             view=None,
         )
+
+
+def create_saved_batch_summary_embed(
+    row,
+    *,
+    page: int,
+    total_pages: int,
+) -> discord.Embed:
+    title = row["title"] or f'Untitled batch #{row["id"]}'
+    message_count = row["message_count"]
+
+    if message_count == 0:
+        description = "*This batch currently has no messages.*"
+    else:
+        content = row["first_message_content"].strip()
+
+        if not content:
+            content = "*First message has no text content.*"
+
+        if len(content) > BATCH_PREVIEW_CONTENT_LIMIT:
+            content = (
+                content[: BATCH_PREVIEW_CONTENT_LIMIT - 3]
+                + "..."
+            )
+
+        description = (
+            f'**First message by {row["first_message_author_name"]}**\n'
+            f"{content}\n\n"
+            f'[Open first message]({row["first_message_jump_url"]})'
+        )
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+    )
+    embed.add_field(
+        name="Created",
+        value=row["created_at"],
+        inline=False,
+    )
+    embed.add_field(
+        name="Messages",
+        value=str(message_count),
+        inline=False,
+    )
+    embed.set_footer(text=f"Page {page}/{total_pages}")
+
+    return embed
+
+
+@bot.tree.command(
+    name="batches",
+    description="Show summaries of your saved message batches",
+)
+@app_commands.describe(
+    page="Choose which page to show",
+)
+async def show_saved_batches(
+    interaction: discord.Interaction,
+    page: app_commands.Range[int, 1] = 1,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    total_batches = await count_saved_batches(
+        saved_by_user_id=str(interaction.user.id),
+    )
+
+    if total_batches == 0:
+        await interaction.edit_original_response(
+            content="You have no saved message batches.",
+        )
+        return
+
+    total_pages = (
+        total_batches + SAVED_BATCHES_PAGE_SIZE - 1
+    ) // SAVED_BATCHES_PAGE_SIZE
+
+    if page > total_pages:
+        await interaction.edit_original_response(
+            content=(
+                f"Page `{page}` does not exist. "
+                f"You have {total_pages} batch page(s)."
+            ),
+        )
+        return
+
+    rows = await get_saved_batches(
+        saved_by_user_id=str(interaction.user.id),
+        limit=SAVED_BATCHES_PAGE_SIZE,
+        offset=(page - 1) * SAVED_BATCHES_PAGE_SIZE,
+    )
+    embeds = [
+        create_saved_batch_summary_embed(
+            row,
+            page=page,
+            total_pages=total_pages,
+        )
+        for row in rows
+    ]
+
+    await interaction.edit_original_response(
+        content=f"Your saved message batches — page {page}/{total_pages}",
+        embeds=embeds,
+    )
 
 
 @bot.tree.command(

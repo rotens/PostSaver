@@ -83,8 +83,21 @@ Range behavior:
 The pending range start is stored in SQLite and survives bot restarts. Selecting
 another start replaces the previous one.
 
-Batch data is stored, but there is not yet a `/batches` command or other batch
-browsing and management interface.
+Batch data can be listed, but there is not yet a batch-detail or management
+interface.
+
+### Viewing batch summaries
+
+`/batches page:<number>` displays five read-only batch summaries per page,
+newest first. Each summary contains:
+
+- the batch title, or an `Untitled batch #<id>` fallback;
+- the batch creation time;
+- the current number of messages;
+- a preview and direct link for the first remaining message.
+
+Empty batches remain visible. The command does not yet open the complete batch
+or provide rename, delete, or status controls.
 
 ## Requirements
 
@@ -169,6 +182,7 @@ The `data/` directory is ignored by Git.
 | Command | Purpose |
 |---|---|
 | `/saved` | Display the user's saved messages with status and page options. |
+| `/batches` | Display paginated, read-only saved-batch summaries. |
 | `/ignore_user` | Ignore messages written by a selected user. |
 | `/unignore_user` | Remove one user from the ignore list. |
 | `/unignore_all` | Reset the user's ignore list. |
@@ -228,7 +242,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 75 tests covering:
+The current suite contains 78 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
 - saved-message status validation, ownership, and deletion;
@@ -239,6 +253,7 @@ The current suite contains 75 tests covering:
 - pending-range creation, replacement, isolation, and deletion;
 - batch creation, ownership, ordering, associations, summaries, and
   paginated contents;
+- `/batches` empty states, page validation, and summary rendering;
 - inclusive and reverse-direction history retrieval;
 - the 1,000-message scan limit and 300-message saved-message limit;
 - ignored-author filtering;
@@ -270,8 +285,8 @@ data/reading_manager.db
 
 ## Current limitations
 
-- Saved batches cannot yet be listed, opened, renamed, or deleted through
-  Discord.
+- Saved batches can be listed, but cannot yet be opened, renamed, or deleted
+  through Discord.
 - `/saved` cannot yet filter by author, channel, server, date, or keywords.
 - Attachments and attachment-only messages are not represented beyond their
   text content.
