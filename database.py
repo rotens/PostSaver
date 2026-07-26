@@ -1021,54 +1021,6 @@ async def get_saved_messages(
         return rows
 
 
-async def save_saved_message_attachments(
-    *,
-    saved_message_id: int,
-    saved_by_user_id: str,
-    attachments: Sequence[AttachmentToSave],
-) -> int:
-    if not attachments:
-        return 0
-
-    _validate_attachments(attachments)
-
-    owner_query = """
-    SELECT 1
-    FROM saved_messages
-    WHERE id = ?
-      AND saved_by_user_id = ?;
-    """
-
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        cursor = await database.execute(
-            owner_query,
-            (
-                saved_message_id,
-                saved_by_user_id,
-            ),
-        )
-
-        if await cursor.fetchone() is None:
-            return 0
-
-        try:
-            await database.execute("BEGIN;")
-            inserted_count = await _insert_saved_message_attachments(
-                database,
-                saved_message_id=saved_message_id,
-                attachments=attachments,
-            )
-
-            await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
-
-    return inserted_count
-
-
 async def get_attachments_for_saved_messages(
     *,
     saved_by_user_id: str,

@@ -36,6 +36,31 @@ def saved_row(
     }
 
 
+def attachment_row(
+    *,
+    saved_message_id: int,
+    attachment_id: str,
+    filename: str,
+    content_type: str | None,
+    size: int,
+    position: int,
+    url: str | None = None,
+) -> dict[str, object]:
+    return {
+        "saved_message_id": saved_message_id,
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "url": url or f"https://cdn.discord.test/{attachment_id}",
+        "proxy_url": f"https://proxy.discord.test/{attachment_id}",
+        "content_type": content_type,
+        "size": size,
+        "description": None,
+        "width": None,
+        "height": None,
+        "position": position,
+    }
+
+
 class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_filter_reports_no_unread_messages(self) -> None:
         interaction = FakeInteraction()
@@ -106,6 +131,27 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
                 status="READ_KEEP",
             ),
         ]
+        attachments_by_message = {
+            7: [
+                attachment_row(
+                    saved_message_id=7,
+                    attachment_id="image-1",
+                    filename="diagram.png",
+                    content_type="image/png",
+                    size=2048,
+                    position=0,
+                ),
+                attachment_row(
+                    saved_message_id=7,
+                    attachment_id="file-1",
+                    filename="notes.pdf",
+                    content_type="application/pdf",
+                    size=4096,
+                    position=1,
+                ),
+            ],
+            6: [],
+        }
 
         with (
             patch.object(
@@ -118,6 +164,11 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
                 "get_saved_messages",
                 new=AsyncMock(return_value=rows),
             ) as get_messages,
+            patch.object(
+                bot,
+                "get_attachments_for_saved_messages",
+                new=AsyncMock(return_value=attachments_by_message),
+            ) as get_attachments,
         ):
             await bot.show_saved_messages.callback(
                 interaction,
@@ -131,6 +182,10 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
             limit=5,
             offset=5,
         )
+        get_attachments.assert_awaited_once_with(
+            saved_by_user_id="42",
+            saved_message_ids=[7, 6],
+        )
         interaction.edit_original_response.assert_awaited_once()
         interaction.followup.send.assert_awaited_once()
 
@@ -143,11 +198,28 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             first_embed.description,
-            "*Message has no text content.*",
+            (
+                "*This message has no text content; "
+                "attachments are listed below.*"
+            ),
+        )
+        self.assertEqual(first_embed.fields[1].name, "Attachments (2)")
+        self.assertIn(
+            "[diagram.png](https://cdn.discord.test/image-1) — 2 KiB",
+            first_embed.fields[1].value,
+        )
+        self.assertIn(
+            "[notes.pdf](https://cdn.discord.test/file-1) — 4 KiB",
+            first_embed.fields[1].value,
+        )
+        self.assertEqual(
+            first_embed.image.url,
+            "https://proxy.discord.test/image-1",
         )
         self.assertEqual(first_embed.footer.text, "Status: UNREAD | Page 2/3")
         self.assertEqual(len(second_embed.description), 1000)
         self.assertTrue(second_embed.description.endswith("..."))
+        self.assertEqual(len(second_embed.fields), 1)
         self.assertEqual(
             second_embed.footer.text,
             "Status: READ_KEEP | Page 2/3",
@@ -163,6 +235,57 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
             ).disabled
         )
         self.assertTrue(second_call.kwargs["ephemeral"])
+
+    async def test_attachment_list_is_truncated_with_omitted_count(
+        self,
+    ) -> None:
+        interaction = FakeInteraction()
+        rows = [saved_row(record_id=7, content="Message")]
+        attachments = [
+            attachment_row(
+                saved_message_id=7,
+                attachment_id=f"attachment-{position}",
+                filename=f"file-{position}.txt",
+                content_type="text/plain",
+                size=position + 1,
+                position=position,
+                url=(
+                    "https://cdn.discord.test/"
+                    + "x" * 300
+                    + str(position)
+                ),
+            )
+            for position in range(10)
+        ]
+
+        with (
+            patch.object(
+                bot,
+                "count_saved_messages",
+                new=AsyncMock(return_value=1),
+            ),
+            patch.object(
+                bot,
+                "get_saved_messages",
+                new=AsyncMock(return_value=rows),
+            ),
+            patch.object(
+                bot,
+                "get_attachments_for_saved_messages",
+                new=AsyncMock(return_value={7: attachments}),
+            ),
+        ):
+            await bot.show_saved_messages.callback(interaction)
+
+        embed = interaction.edit_original_response.await_args.kwargs["embed"]
+        attachment_field = embed.fields[1]
+
+        self.assertLessEqual(
+            len(attachment_field.value),
+            bot.SAVED_ATTACHMENT_FIELD_VALUE_LIMIT,
+        )
+        self.assertIn("more attachments omitted", attachment_field.value)
+        self.assertIsNone(embed.image.url)
 
 
 if __name__ == "__main__":

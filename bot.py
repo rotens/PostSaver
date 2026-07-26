@@ -13,6 +13,7 @@ from database import (
     delete_pending_range_if_matches,
     delete_saved_message,
     get_ignored_user_ids,
+    get_attachments_for_saved_messages,
     get_pending_range,
     get_saved_batches,
     get_saved_messages,
@@ -33,7 +34,9 @@ load_dotenv()
 
 SAVED_MESSAGES_PAGE_SIZE = 5
 SAVED_BATCHES_PAGE_SIZE = 5
-BATCH_PREVIEW_CONTENT_LIMIT = 700
+BATCH_PREVIEW_CONTENT_LIMIT = 350
+SAVED_ATTACHMENT_FIELD_VALUE_LIMIT = 1024
+BATCH_ATTACHMENT_FIELD_VALUE_LIMIT = 400
 MAX_RANGE_MESSAGES_TO_SCAN = 1000
 MAX_SAVED_MESSAGES_PER_RANGE = 300
 
@@ -81,6 +84,104 @@ def prepare_attachments_to_save(
         )
         for position, attachment in enumerate(attachments)
     )
+
+
+def format_file_size(size: int) -> str:
+    value = float(size)
+
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+
+            formatted_value = f"{value:.1f}".rstrip("0").rstrip(".")
+            return f"{formatted_value} {unit}"
+
+        value /= 1024
+
+    raise RuntimeError("Failed to format attachment size")
+
+
+def format_attachment_list(
+    attachments,
+    *,
+    max_length: int,
+) -> str:
+    if max_length < 1:
+        raise ValueError("Attachment display limit must be positive")
+
+    lines = []
+
+    for attachment in attachments:
+        filename = " ".join(attachment["filename"].splitlines()).strip()
+
+        if not filename:
+            filename = "Unnamed attachment"
+
+        filename = discord.utils.escape_markdown(filename)
+        filename = filename.replace("[", "\\[").replace("]", "\\]")
+        line = (
+            f'[{filename}]({attachment["url"]}) — '
+            f'{format_file_size(attachment["size"])}'
+        )
+        candidate = "\n".join([*lines, line])
+
+        if len(candidate) > max_length:
+            break
+
+        lines.append(line)
+
+    omitted_count = len(attachments) - len(lines)
+
+    while omitted_count:
+        noun = "attachment" if omitted_count == 1 else "attachments"
+        omission = f"*{omitted_count} more {noun} omitted.*"
+        candidate = "\n".join([*lines, omission])
+
+        if len(candidate) <= max_length:
+            return candidate
+
+        if not lines:
+            return omission[:max_length]
+
+        lines.pop()
+        omitted_count += 1
+
+    return "\n".join(lines)
+
+
+def add_attachments_to_embed(
+    embed: discord.Embed,
+    attachments,
+    *,
+    field_value_limit: int,
+) -> None:
+    if not attachments:
+        return
+
+    embed.add_field(
+        name=f"Attachments ({len(attachments)})",
+        value=format_attachment_list(
+            attachments,
+            max_length=field_value_limit,
+        ),
+        inline=False,
+    )
+
+    image_attachment = next(
+        (
+            attachment
+            for attachment in attachments
+            if attachment["content_type"]
+            and attachment["content_type"].lower().startswith("image/")
+        ),
+        None,
+    )
+
+    if image_attachment is not None:
+        embed.set_image(
+            url=image_attachment["proxy_url"] or image_attachment["url"],
+        )
 
 
 async def get_messages_in_range(
@@ -742,6 +843,7 @@ class SavedMessageView(discord.ui.View):
 def create_saved_batch_summary_embed(
     row,
     *,
+    attachments,
     page: int,
     total_pages: int,
 ) -> discord.Embed:
@@ -754,7 +856,13 @@ def create_saved_batch_summary_embed(
         content = row["first_message_content"].strip()
 
         if not content:
-            content = "*First message has no text content.*"
+            if attachments:
+                content = (
+                    "*First message has no text content; "
+                    "attachments are listed below.*"
+                )
+            else:
+                content = "*First message has no text content.*"
 
         if len(content) > BATCH_PREVIEW_CONTENT_LIMIT:
             content = (
@@ -781,6 +889,11 @@ def create_saved_batch_summary_embed(
         name="Messages",
         value=str(message_count),
         inline=False,
+    )
+    add_attachments_to_embed(
+        embed,
+        attachments,
+        field_value_limit=BATCH_ATTACHMENT_FIELD_VALUE_LIMIT,
     )
     embed.set_footer(text=f"Page {page}/{total_pages}")
 
@@ -828,9 +941,22 @@ async def show_saved_batches(
         limit=SAVED_BATCHES_PAGE_SIZE,
         offset=(page - 1) * SAVED_BATCHES_PAGE_SIZE,
     )
+    first_message_record_ids = [
+        row["first_message_record_id"]
+        for row in rows
+        if row["first_message_record_id"] is not None
+    ]
+    attachments_by_message = await get_attachments_for_saved_messages(
+        saved_by_user_id=str(interaction.user.id),
+        saved_message_ids=first_message_record_ids,
+    )
     embeds = [
         create_saved_batch_summary_embed(
             row,
+            attachments=attachments_by_message.get(
+                row["first_message_record_id"],
+                [],
+            ),
             page=page,
             total_pages=total_pages,
         )
@@ -915,12 +1041,23 @@ async def show_saved_messages(
         limit=SAVED_MESSAGES_PAGE_SIZE,
         offset=(page - 1) * SAVED_MESSAGES_PAGE_SIZE,
     )
+    attachments_by_message = await get_attachments_for_saved_messages(
+        saved_by_user_id=str(interaction.user.id),
+        saved_message_ids=[row["id"] for row in rows],
+    )
 
     for index, row in enumerate(rows):
         content = row["content"].strip()
+        attachments = attachments_by_message[row["id"]]
 
         if not content:
-            content = "*Message has no text content.*"
+            if attachments:
+                content = (
+                    "*This message has no text content; "
+                    "attachments are listed below.*"
+                )
+            else:
+                content = "*Message has no text content.*"
 
         if len(content) > 1000:
             content = content[:997] + "..."
@@ -934,6 +1071,11 @@ async def show_saved_messages(
             name="Created",
             value=row["message_created_at"],
             inline=False,
+        )
+        add_attachments_to_embed(
+            embed,
+            attachments,
+            field_value_limit=SAVED_ATTACHMENT_FIELD_VALUE_LIMIT,
         )
 
         embed.set_footer(

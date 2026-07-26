@@ -338,7 +338,6 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_save_and_get_attachments_preserves_metadata_and_order(
         self,
     ) -> None:
-        saved_message_id = await self.save_message()
         later_attachment = self.attachment(
             "attachment-2",
             1,
@@ -348,14 +347,11 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
             height=None,
         )
         first_attachment = self.attachment("attachment-1", 0)
-
-        inserted_count = await database.save_saved_message_attachments(
-            saved_message_id=saved_message_id,
-            saved_by_user_id="user-1",
-            attachments=[
+        saved_message_id = await self.save_message(
+            attachments=(
                 later_attachment,
                 first_attachment,
-            ],
+            ),
         )
         result = await database.get_attachments_for_saved_messages(
             saved_by_user_id="user-1",
@@ -366,7 +362,6 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertEqual(inserted_count, 2)
         self.assertEqual(set(result), {saved_message_id, 999})
         self.assertEqual(result[999], [])
         self.assertEqual(
@@ -405,62 +400,57 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(second_row["height"])
 
     async def test_duplicate_attachment_is_ignored(self) -> None:
-        saved_message_id = await self.save_message()
         attachment = self.attachment("attachment-1", 0)
-
-        first_count = await database.save_saved_message_attachments(
-            saved_message_id=saved_message_id,
-            saved_by_user_id="user-1",
-            attachments=[attachment],
+        saved_message_id = await self.save_message(
+            attachments=(attachment,),
         )
-        duplicate_count = await database.save_saved_message_attachments(
-            saved_message_id=saved_message_id,
+        was_inserted = await database.save_unread_message(
             saved_by_user_id="user-1",
-            attachments=[attachment],
+            message_id="message-1",
+            guild_id="guild-1",
+            channel_id="channel-1",
+            author_id="author-1",
+            author_name="Author",
+            content="Message content",
+            jump_url="https://example.com/messages/message-1",
+            message_created_at="2026-07-25T00:00:00+00:00",
+            attachments=(attachment,),
+        )
+        result = await database.get_attachments_for_saved_messages(
+            saved_by_user_id="user-1",
+            saved_message_ids=[saved_message_id],
         )
 
-        self.assertEqual(first_count, 1)
-        self.assertEqual(duplicate_count, 0)
+        self.assertFalse(was_inserted)
+        self.assertEqual(len(result[saved_message_id]), 1)
 
     async def test_attachment_ids_are_scoped_to_saved_message(self) -> None:
-        first_message_id = await self.save_message(message_id="message-1")
-        second_message_id = await self.save_message(message_id="message-2")
         attachment = self.attachment("shared-attachment", 0)
-
-        first_count = await database.save_saved_message_attachments(
-            saved_message_id=first_message_id,
-            saved_by_user_id="user-1",
-            attachments=[attachment],
+        first_message_id = await self.save_message(
+            message_id="message-1",
+            attachments=(attachment,),
         )
-        second_count = await database.save_saved_message_attachments(
-            saved_message_id=second_message_id,
+        second_message_id = await self.save_message(
+            message_id="message-2",
+            attachments=(attachment,),
+        )
+        result = await database.get_attachments_for_saved_messages(
             saved_by_user_id="user-1",
-            attachments=[attachment],
+            saved_message_ids=[first_message_id, second_message_id],
         )
 
-        self.assertEqual(first_count, 1)
-        self.assertEqual(second_count, 1)
+        self.assertEqual(len(result[first_message_id]), 1)
+        self.assertEqual(len(result[second_message_id]), 1)
 
     async def test_save_and_get_require_message_ownership(self) -> None:
         first_user_message_id = await self.save_message(
             saved_by_user_id="user-1",
             message_id="message-1",
+            attachments=(self.attachment("attachment-1", 0),),
         )
         second_user_message_id = await self.save_message(
             saved_by_user_id="user-2",
             message_id="message-2",
-        )
-        attachment = self.attachment("attachment-1", 0)
-
-        wrong_owner_count = await database.save_saved_message_attachments(
-            saved_message_id=first_user_message_id,
-            saved_by_user_id="user-2",
-            attachments=[attachment],
-        )
-        correct_owner_count = await database.save_saved_message_attachments(
-            saved_message_id=first_user_message_id,
-            saved_by_user_id="user-1",
-            attachments=[attachment],
         )
         second_user_result = (
             await database.get_attachments_for_saved_messages(
@@ -472,13 +462,10 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(wrong_owner_count, 0)
-        self.assertEqual(correct_owner_count, 1)
         self.assertEqual(second_user_result[first_user_message_id], [])
         self.assertEqual(second_user_result[second_user_message_id], [])
 
     async def test_invalid_attachment_values_are_rejected(self) -> None:
-        saved_message_id = await self.save_message()
         invalid_attachments = [
             (
                 self.attachment("negative-position", -1),
@@ -503,74 +490,35 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
                 self.subTest(attachment=attachment.attachment_id),
                 self.assertRaisesRegex(ValueError, expected_message),
             ):
-                await database.save_saved_message_attachments(
-                    saved_message_id=saved_message_id,
-                    saved_by_user_id="user-1",
-                    attachments=[attachment],
+                await self.save_message(
+                    message_id=attachment.attachment_id,
+                    attachments=(attachment,),
                 )
 
     async def test_duplicate_ids_and_positions_are_rejected(self) -> None:
-        saved_message_id = await self.save_message()
-
         with self.assertRaisesRegex(ValueError, "IDs must be unique"):
-            await database.save_saved_message_attachments(
-                saved_message_id=saved_message_id,
-                saved_by_user_id="user-1",
-                attachments=[
+            await self.save_message(
+                message_id="duplicate-ids",
+                attachments=(
                     self.attachment("attachment-1", 0),
                     self.attachment("attachment-1", 1),
-                ],
+                ),
             )
 
         with self.assertRaisesRegex(ValueError, "positions must be unique"):
-            await database.save_saved_message_attachments(
-                saved_message_id=saved_message_id,
-                saved_by_user_id="user-1",
-                attachments=[
+            await self.save_message(
+                message_id="duplicate-positions",
+                attachments=(
                     self.attachment("attachment-1", 0),
                     self.attachment("attachment-2", 0),
-                ],
+                ),
             )
-
-    async def test_position_conflict_rolls_back_the_whole_call(self) -> None:
-        saved_message_id = await self.save_message()
-        await database.save_saved_message_attachments(
-            saved_message_id=saved_message_id,
-            saved_by_user_id="user-1",
-            attachments=[self.attachment("existing", 0)],
-        )
-
-        with self.assertRaises(sqlite3.IntegrityError):
-            await database.save_saved_message_attachments(
-                saved_message_id=saved_message_id,
-                saved_by_user_id="user-1",
-                attachments=[
-                    self.attachment("would-be-inserted", 1),
-                    self.attachment("position-conflict", 0),
-                ],
-            )
-
-        result = await database.get_attachments_for_saved_messages(
-            saved_by_user_id="user-1",
-            saved_message_ids=[saved_message_id],
-        )
-
-        self.assertEqual(
-            [
-                row["attachment_id"]
-                for row in result[saved_message_id]
-            ],
-            ["existing"],
-        )
 
     async def test_deleting_saved_message_cascades_to_attachments(
         self,
     ) -> None:
-        saved_message_id = await self.save_message()
-        await database.save_saved_message_attachments(
-            saved_message_id=saved_message_id,
-            saved_by_user_id="user-1",
-            attachments=[self.attachment("attachment-1", 0)],
+        saved_message_id = await self.save_message(
+            attachments=(self.attachment("attachment-1", 0),),
         )
 
         was_deleted = await database.delete_saved_message(
@@ -588,15 +536,9 @@ class SavedMessageAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row[0], 0)
 
     async def test_empty_inputs_are_no_ops(self) -> None:
-        inserted_count = await database.save_saved_message_attachments(
-            saved_message_id=999,
-            saved_by_user_id="user-1",
-            attachments=[],
-        )
         result = await database.get_attachments_for_saved_messages(
             saved_by_user_id="user-1",
             saved_message_ids=[],
         )
 
-        self.assertEqual(inserted_count, 0)
         self.assertEqual(result, {})

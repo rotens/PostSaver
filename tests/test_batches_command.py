@@ -48,6 +48,30 @@ def batch_summary(
     }
 
 
+def attachment_row(
+    *,
+    saved_message_id: int,
+    attachment_id: str,
+    filename: str,
+    content_type: str | None,
+    size: int,
+    position: int,
+) -> dict[str, object]:
+    return {
+        "saved_message_id": saved_message_id,
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "url": f"https://cdn.discord.test/{attachment_id}",
+        "proxy_url": f"https://proxy.discord.test/{attachment_id}",
+        "content_type": content_type,
+        "size": size,
+        "description": None,
+        "width": None,
+        "height": None,
+        "position": position,
+    }
+
+
 class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_batches_returns_ephemeral_empty_state(self) -> None:
         interaction = FakeInteraction()
@@ -129,6 +153,36 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
                 message_count=0,
             ),
         ]
+        attachments_by_message = {
+            70: [
+                attachment_row(
+                    saved_message_id=70,
+                    attachment_id="image-1",
+                    filename="architecture.png",
+                    content_type="image/png",
+                    size=2048,
+                    position=0,
+                ),
+                attachment_row(
+                    saved_message_id=70,
+                    attachment_id="file-1",
+                    filename="architecture.pdf",
+                    content_type="application/pdf",
+                    size=4096,
+                    position=1,
+                ),
+            ],
+            60: [
+                attachment_row(
+                    saved_message_id=60,
+                    attachment_id="file-2",
+                    filename="notes.txt",
+                    content_type="text/plain",
+                    size=512,
+                    position=0,
+                ),
+            ],
+        }
 
         with (
             patch.object(
@@ -141,6 +195,11 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
                 "get_saved_batches",
                 new=AsyncMock(return_value=rows),
             ) as get_batches,
+            patch.object(
+                bot,
+                "get_attachments_for_saved_messages",
+                new=AsyncMock(return_value=attachments_by_message),
+            ) as get_attachments,
         ):
             await bot.show_saved_batches.callback(
                 interaction,
@@ -151,6 +210,10 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
             saved_by_user_id="42",
             limit=5,
             offset=5,
+        )
+        get_attachments.assert_awaited_once_with(
+            saved_by_user_id="42",
+            saved_message_ids=[70, 60],
         )
         interaction.edit_original_response.assert_awaited_once()
         call = interaction.edit_original_response.await_args
@@ -175,19 +238,92 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embeds[0].fields[0].value, "2026-07-24 12:00:00")
         self.assertEqual(embeds[0].fields[1].name, "Messages")
         self.assertEqual(embeds[0].fields[1].value, "12")
+        self.assertEqual(embeds[0].fields[2].name, "Attachments (2)")
+        self.assertIn("architecture.png", embeds[0].fields[2].value)
+        self.assertIn("architecture.pdf", embeds[0].fields[2].value)
+        self.assertEqual(
+            embeds[0].image.url,
+            "https://proxy.discord.test/image-1",
+        )
         self.assertEqual(embeds[0].footer.text, "Page 2/3")
 
         self.assertEqual(embeds[1].title, "Untitled batch #6")
         self.assertIn(
-            "*First message has no text content.*",
+            (
+                "*First message has no text content; "
+                "attachments are listed below.*"
+            ),
             embeds[1].description,
         )
+        self.assertEqual(embeds[1].fields[2].name, "Attachments (1)")
+        self.assertIn("notes.txt", embeds[1].fields[2].value)
+        self.assertIsNone(embeds[1].image.url)
         self.assertEqual(embeds[2].title, "Empty batch")
         self.assertEqual(
             embeds[2].description,
             "*This batch currently has no messages.*",
         )
+        self.assertEqual(len(embeds[2].fields), 2)
         self.assertNotIn("view", call.kwargs)
+
+    async def test_full_page_stays_within_discord_embed_text_limit(
+        self,
+    ) -> None:
+        interaction = FakeInteraction()
+        rows = [
+            batch_summary(
+                batch_id=batch_id,
+                title="T" * 100,
+                message_count=10,
+                content="x" * 1000,
+            )
+            for batch_id in range(1, 6)
+        ]
+        attachments_by_message = {
+            batch_id * 10: [
+                attachment_row(
+                    saved_message_id=batch_id * 10,
+                    attachment_id=f"{batch_id}-{position}",
+                    filename=f"attachment-{position}.png",
+                    content_type="image/png",
+                    size=2048,
+                    position=position,
+                )
+                for position in range(5)
+            ]
+            for batch_id in range(1, 6)
+        }
+
+        with (
+            patch.object(
+                bot,
+                "count_saved_batches",
+                new=AsyncMock(return_value=5),
+            ),
+            patch.object(
+                bot,
+                "get_saved_batches",
+                new=AsyncMock(return_value=rows),
+            ),
+            patch.object(
+                bot,
+                "get_attachments_for_saved_messages",
+                new=AsyncMock(return_value=attachments_by_message),
+            ),
+        ):
+            await bot.show_saved_batches.callback(interaction)
+
+        embeds = interaction.edit_original_response.await_args.kwargs["embeds"]
+
+        self.assertEqual(len(embeds), 5)
+        self.assertLessEqual(sum(len(embed) for embed in embeds), 6000)
+        self.assertTrue(
+            all(
+                len(embed.fields[2].value)
+                <= bot.BATCH_ATTACHMENT_FIELD_VALUE_LIMIT
+                for embed in embeds
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -27,6 +27,10 @@ The bot uses:
 - Saving the same Discord message twice for the same user does not create a
   duplicate.
 - Records and button actions are scoped to the user who saved them.
+- Saved-message panels list stored attachments as filename links with readable
+  file sizes and preview the first image attachment.
+- Attachment-only messages display a dedicated no-text explanation instead of
+  appearing empty.
 
 The stored statuses are:
 
@@ -76,7 +80,7 @@ Range behavior:
 - Existing `READ_KEEP` records are not reset to `UNREAD`.
 - A successful operation creates one batch and ordered message associations.
 - Batch creation, message insertion, association, and pending-range cleanup are
-  performed in one SQLite transaction.
+  performed in one SQLite transaction together with attachment metadata.
 - The final ephemeral response reports total, newly saved, already saved, and
   ignored message counts.
 
@@ -94,10 +98,27 @@ newest first. Each summary contains:
 - the batch title, or an `Untitled batch #<id>` fallback;
 - the batch creation time;
 - the current number of messages;
-- a preview and direct link for the first remaining message.
+- a preview and direct link for the first remaining message;
+- attachment links and the first image preview from that first message.
 
 Empty batches remain visible. The command does not yet open the complete batch
 or provide rename, delete, or status controls.
+
+### Attachments
+
+Both individual-message and range saving preserve attachment metadata,
+including the filename, Discord URLs, media type, byte size, optional alt text,
+dimensions, and original order.
+
+`/saved` lists the attachments belonging to each displayed record. `/batches`
+lists attachments only for the first remaining message used by each batch
+summary. The first image attachment is shown as the embed image; other images
+and non-image files remain links. Long attachment lists are shortened with an
+omitted-item count to stay within Discord embed limits.
+
+The bot stores metadata and URLs, not the attachment file contents. It is not
+an attachment archive: a stored URL can eventually stop working if the
+original Discord attachment becomes unavailable.
 
 ## Requirements
 
@@ -275,11 +296,12 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 93 tests covering:
+The current suite contains 94 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
 - attachment schema, metadata conversion, ordering, validation, ownership,
-  single-message and range capture, transaction rollback, and cascade deletion;
+  single-message and range capture, transaction rollback, cascade deletion,
+  command rendering, image previews, and display truncation;
 - saved-message status validation, ownership, and deletion;
 - ignored-user creation, removal, reset, self-ignore, and owner isolation;
 - Discord command responses and metadata passed to the database layer;
@@ -324,8 +346,8 @@ data/reading_manager.db
 - Saved batches can be listed, but cannot yet be opened, renamed, or deleted
   through Discord.
 - `/saved` cannot yet filter by author, channel, server, date, or keywords.
-- Single-message and range workflows store attachment metadata, but
-  saved-message and batch views do not display it yet.
+- Attachment files are not downloaded or archived; views depend on stored
+  Discord URLs remaining available.
 - Messages inside a batch do not yet have a dedicated batch-detail view.
 - Batch-level status changes are not implemented.
 - Persistent Discord views across bot restarts are not implemented.
