@@ -24,6 +24,29 @@ class FakeAuthor:
         return self.name
 
 
+class FakeAttachment:
+    def __init__(
+        self,
+        attachment_id: int,
+        *,
+        filename: str,
+        content_type: str | None = None,
+        size: int = 100,
+        description: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        self.id = attachment_id
+        self.filename = filename
+        self.url = f"https://cdn.discord.test/{attachment_id}"
+        self.proxy_url = f"https://proxy.discord.test/{attachment_id}"
+        self.content_type = content_type
+        self.size = size
+        self.description = description
+        self.width = width
+        self.height = height
+
+
 class FakeChannel:
     def __init__(self, channel_id: int) -> None:
         self.id = channel_id
@@ -58,6 +81,7 @@ class FakeMessage:
         channel: FakeChannel,
         author_id: int,
         content: str | None = None,
+        attachments: list[FakeAttachment] | None = None,
     ) -> None:
         self.id = message_id
         self.guild = SimpleNamespace(id=10)
@@ -66,6 +90,7 @@ class FakeMessage:
         self.content = content or f"Message {message_id}"
         self.jump_url = f"https://discord.test/{message_id}"
         self.created_at = datetime(2026, 7, 22, tzinfo=timezone.utc)
+        self.attachments = attachments or []
 
 
 class FakeInteraction:
@@ -315,7 +340,22 @@ class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         channel = FakeChannel(20)
-        start = FakeMessage(100, channel=channel, author_id=1)
+        start = FakeMessage(
+            100,
+            channel=channel,
+            author_id=1,
+            attachments=[
+                FakeAttachment(
+                    501,
+                    filename="start.png",
+                    content_type="image/png",
+                    size=2048,
+                    description="Start image",
+                    width=1280,
+                    height=720,
+                ),
+            ],
+        )
         ignored = FakeMessage(200, channel=channel, author_id=2)
         end = FakeMessage(300, channel=channel, author_id=3)
         channel.fetched_message = start
@@ -371,6 +411,24 @@ class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
             [message.position for message in prepared_messages],
             [0, 1],
         )
+        self.assertEqual(
+            prepared_messages[0].attachments,
+            (
+                bot.AttachmentToSave(
+                    attachment_id="501",
+                    filename="start.png",
+                    url="https://cdn.discord.test/501",
+                    proxy_url="https://proxy.discord.test/501",
+                    content_type="image/png",
+                    size=2048,
+                    description="Start image",
+                    width=1280,
+                    height=720,
+                    position=0,
+                ),
+            ),
+        )
+        self.assertEqual(prepared_messages[1].attachments, ())
         self.assertIn("Batch: Topic", interaction.edited_content[0])
         self.assertIn("Messages in range: 3", interaction.edited_content[0])
         self.assertIn("Saved: 1", interaction.edited_content[0])

@@ -5,7 +5,7 @@ set -euo pipefail
 PROJECT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DATABASE_PATH="$PROJECT_DIRECTORY/data/reading_manager.db"
 BACKUP_DIRECTORY="$PROJECT_DIRECTORY/data/backups"
-REQUIRED_TABLE_COUNT=5
+REQUIRED_TABLE_COUNT=6
 
 usage() {
     cat <<'EOF'
@@ -67,6 +67,7 @@ verify_application_database() {
             WHERE type = 'table'
               AND name IN (
                   'saved_messages',
+                  'saved_message_attachments',
                   'ignored_users',
                   'pending_ranges',
                   'saved_batches',
@@ -143,6 +144,9 @@ show_table_counts() {
 SELECT 'saved_messages' AS table_name, COUNT(*) AS row_count
 FROM saved_messages
 UNION ALL
+SELECT 'saved_message_attachments', COUNT(*)
+FROM saved_message_attachments
+UNION ALL
 SELECT 'ignored_users', COUNT(*)
 FROM ignored_users
 UNION ALL
@@ -180,6 +184,7 @@ BEGIN IMMEDIATE;
 
 DELETE FROM saved_batch_messages;
 DELETE FROM saved_batches;
+DELETE FROM saved_message_attachments;
 DELETE FROM saved_messages;
 DELETE FROM pending_ranges;
 DELETE FROM ignored_users;

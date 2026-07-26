@@ -23,6 +23,29 @@ class FakeAuthor:
         return self.name
 
 
+class FakeAttachment:
+    def __init__(
+        self,
+        attachment_id: int,
+        *,
+        filename: str,
+        content_type: str | None,
+        size: int,
+        description: str | None,
+        width: int | None,
+        height: int | None,
+    ) -> None:
+        self.id = attachment_id
+        self.filename = filename
+        self.url = f"https://cdn.discord.test/{attachment_id}"
+        self.proxy_url = f"https://proxy.discord.test/{attachment_id}"
+        self.content_type = content_type
+        self.size = size
+        self.description = description
+        self.width = width
+        self.height = height
+
+
 class FakeMessage:
     def __init__(
         self,
@@ -31,6 +54,7 @@ class FakeMessage:
         author: FakeAuthor | None = None,
         guild_id: int | None = 10,
         channel_id: int = 20,
+        attachments: list[FakeAttachment] | None = None,
     ) -> None:
         self.id = message_id
         self.author = author or FakeAuthor(30)
@@ -43,6 +67,7 @@ class FakeMessage:
         self.content = "Message content"
         self.jump_url = f"https://discord.test/{message_id}"
         self.created_at = datetime(2026, 7, 23, tzinfo=timezone.utc)
+        self.attachments = attachments or []
 
 
 class FakeInteraction:
@@ -90,7 +115,28 @@ class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         interaction = FakeInteraction()
-        message = FakeMessage()
+        message = FakeMessage(
+            attachments=[
+                FakeAttachment(
+                    501,
+                    filename="diagram.png",
+                    content_type="image/png",
+                    size=2048,
+                    description="Architecture diagram",
+                    width=1280,
+                    height=720,
+                ),
+                FakeAttachment(
+                    502,
+                    filename="notes.pdf",
+                    content_type="application/pdf",
+                    size=4096,
+                    description=None,
+                    width=None,
+                    height=None,
+                ),
+            ],
+        )
 
         with (
             patch.object(
@@ -116,6 +162,32 @@ class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
             content="Message content",
             jump_url="https://discord.test/100",
             message_created_at="2026-07-23T00:00:00+00:00",
+            attachments=(
+                bot.AttachmentToSave(
+                    attachment_id="501",
+                    filename="diagram.png",
+                    url="https://cdn.discord.test/501",
+                    proxy_url="https://proxy.discord.test/501",
+                    content_type="image/png",
+                    size=2048,
+                    description="Architecture diagram",
+                    width=1280,
+                    height=720,
+                    position=0,
+                ),
+                bot.AttachmentToSave(
+                    attachment_id="502",
+                    filename="notes.pdf",
+                    url="https://cdn.discord.test/502",
+                    proxy_url="https://proxy.discord.test/502",
+                    content_type="application/pdf",
+                    size=4096,
+                    description=None,
+                    width=None,
+                    height=None,
+                    position=1,
+                ),
+            ),
         )
         interaction.response.send_message.assert_awaited_once_with(
             "Saved as UNREAD: https://discord.test/100",

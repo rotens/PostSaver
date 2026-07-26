@@ -185,7 +185,7 @@ repository includes a helper for manual-test resets:
 ```
 
 The command creates and verifies a timestamped SQLite backup in
-`data/backups/` before clearing all five application tables. It also resets
+`data/backups/` before clearing all six application tables. It also resets
 the autoincrement counters for saved messages and batches. Type `CLEAR` when
 prompted, or add `--yes` to intentionally skip the prompt.
 
@@ -248,6 +248,7 @@ All command responses and saved-message panels are currently ephemeral.
 | Table | Purpose |
 |---|---|
 | `saved_messages` | Per-user saved Discord message records and statuses. |
+| `saved_message_attachments` | Ordered attachment metadata belonging to saved messages. |
 | `ignored_users` | Per-user ignored-author settings. |
 | `pending_ranges` | One persistent pending range start per user. |
 | `saved_batches` | Optional titles and metadata for saved message batches. |
@@ -259,8 +260,9 @@ Discord IDs are stored as text. Duplicate saved records are prevented by:
 UNIQUE(saved_by_user_id, message_id)
 ```
 
-Deleting a saved message removes its batch associations through foreign-key
-cascading. It does not automatically delete a batch that becomes empty.
+Deleting a saved message removes its attachment metadata and batch
+associations through foreign-key cascading. It does not automatically delete
+a batch that becomes empty.
 
 ## Tests
 
@@ -273,9 +275,11 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 78 tests covering:
+The current suite contains 93 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
+- attachment schema, metadata conversion, ordering, validation, ownership,
+  single-message and range capture, transaction rollback, and cascade deletion;
 - saved-message status validation, ownership, and deletion;
 - ignored-user creation, removal, reset, self-ignore, and owner isolation;
 - Discord command responses and metadata passed to the database layer;
@@ -305,7 +309,8 @@ database.py
     SQLite schema and asynchronous database functions.
 
 tests/
-    Unit tests for pending ranges, batches, and completed range saving.
+    Unit tests for saved messages, attachments, pending ranges, batches, and
+    completed range saving.
 
 requirements.txt
     Direct Python runtime dependencies.
@@ -319,8 +324,8 @@ data/reading_manager.db
 - Saved batches can be listed, but cannot yet be opened, renamed, or deleted
   through Discord.
 - `/saved` cannot yet filter by author, channel, server, date, or keywords.
-- Attachments and attachment-only messages are not represented beyond their
-  text content.
+- Single-message and range workflows store attachment metadata, but
+  saved-message and batch views do not display it yet.
 - Messages inside a batch do not yet have a dedicated batch-detail view.
 - Batch-level status changes are not implemented.
 - Persistent Discord views across bot restarts are not implemented.

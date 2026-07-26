@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -5,6 +6,20 @@ import aiosqlite
 
 
 DATABASE_PATH = Path("data/reading_manager.db")
+
+
+@dataclass(frozen=True)
+class AttachmentToSave:
+    attachment_id: str
+    filename: str
+    url: str
+    proxy_url: str
+    content_type: str | None
+    size: int
+    description: str | None
+    width: int | None
+    height: int | None
+    position: int
 
 
 @dataclass(frozen=True)
@@ -18,6 +33,7 @@ class MessageToSave:
     jump_url: str
     message_created_at: str
     position: int
+    attachments: tuple[AttachmentToSave, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -54,6 +70,30 @@ CREATE TABLE IF NOT EXISTS saved_messages (
         CHECK (status IN ('UNREAD', 'READ_KEEP')),
 
     UNIQUE(saved_by_user_id, message_id)
+);
+"""
+
+
+CREATE_SAVED_MESSAGE_ATTACHMENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS saved_message_attachments (
+    saved_message_id INTEGER NOT NULL,
+    attachment_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    url TEXT NOT NULL,
+    proxy_url TEXT NOT NULL,
+    content_type TEXT,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    description TEXT,
+    width INTEGER CHECK (width IS NULL OR width >= 0),
+    height INTEGER CHECK (height IS NULL OR height >= 0),
+    position INTEGER NOT NULL CHECK (position >= 0),
+
+    PRIMARY KEY (saved_message_id, attachment_id),
+    UNIQUE (saved_message_id, position),
+
+    FOREIGN KEY (saved_message_id)
+        REFERENCES saved_messages(id)
+        ON DELETE CASCADE
 );
 """
 
@@ -120,12 +160,92 @@ async def initialize_database() -> None:
     async with aiosqlite.connect(DATABASE_PATH) as database:
         await database.execute("PRAGMA foreign_keys = ON;")
         await database.execute(CREATE_SAVED_MESSAGES_TABLE)
+        await database.execute(CREATE_SAVED_MESSAGE_ATTACHMENTS_TABLE)
         await database.execute(CREATE_IGNORED_USERS_TABLE)
         await database.execute(CREATE_PENDING_RANGES_TABLE)
         await database.execute(CREATE_SAVED_BATCHES_TABLE)
         await database.execute(CREATE_SAVED_BATCH_MESSAGES_TABLE)
         await database.execute(CREATE_SAVED_BATCH_MESSAGE_INDEX)
         await database.commit()
+
+
+def _validate_attachments(
+    attachments: Sequence[AttachmentToSave],
+) -> None:
+    attachment_ids = [
+        attachment.attachment_id
+        for attachment in attachments
+    ]
+    positions = [
+        attachment.position
+        for attachment in attachments
+    ]
+
+    if len(attachment_ids) != len(set(attachment_ids)):
+        raise ValueError("Attachment IDs must be unique")
+
+    if len(positions) != len(set(positions)):
+        raise ValueError("Attachment positions must be unique")
+
+    for attachment in attachments:
+        if attachment.position < 0:
+            raise ValueError("Attachment positions cannot be negative")
+
+        if attachment.size < 0:
+            raise ValueError("Attachment sizes cannot be negative")
+
+        if attachment.width is not None and attachment.width < 0:
+            raise ValueError("Attachment widths cannot be negative")
+
+        if attachment.height is not None and attachment.height < 0:
+            raise ValueError("Attachment heights cannot be negative")
+
+
+async def _insert_saved_message_attachments(
+    database: aiosqlite.Connection,
+    *,
+    saved_message_id: int,
+    attachments: Sequence[AttachmentToSave],
+) -> int:
+    query = """
+    INSERT INTO saved_message_attachments (
+        saved_message_id,
+        attachment_id,
+        filename,
+        url,
+        proxy_url,
+        content_type,
+        size,
+        description,
+        width,
+        height,
+        position
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(saved_message_id, attachment_id) DO NOTHING;
+    """
+    inserted_count = 0
+
+    for attachment in attachments:
+        cursor = await database.execute(
+            query,
+            (
+                saved_message_id,
+                attachment.attachment_id,
+                attachment.filename,
+                attachment.url,
+                attachment.proxy_url,
+                attachment.content_type,
+                attachment.size,
+                attachment.description,
+                attachment.width,
+                attachment.height,
+                attachment.position,
+            ),
+        )
+        inserted_count += cursor.rowcount
+
+    return inserted_count
 
 
 async def set_pending_range_start(
@@ -497,6 +617,9 @@ async def save_message_range_as_batch(
     if len(positions) != len(set(positions)):
         raise ValueError("Batch message positions must be unique")
 
+    for message in messages:
+        _validate_attachments(message.attachments)
+
     normalized_title = title.strip() if title else None
 
     if not normalized_title:
@@ -616,6 +739,12 @@ async def save_message_range_as_batch(
 
                 if row is None:
                     raise RuntimeError("Failed to find saved message record")
+
+                await _insert_saved_message_attachments(
+                    database,
+                    saved_message_id=row[0],
+                    attachments=message.attachments,
+                )
 
                 await database.execute(
                     associate_message_query,
@@ -776,7 +905,10 @@ async def save_unread_message(
     content: str,
     jump_url: str,
     message_created_at: str,
+    attachments: Sequence[AttachmentToSave] = (),
 ) -> bool:
+    _validate_attachments(attachments)
+
     query = """
     INSERT OR IGNORE INTO saved_messages (
         saved_by_user_id,
@@ -793,6 +925,13 @@ async def save_unread_message(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
     """
 
+    get_saved_message_id_query = """
+    SELECT id
+    FROM saved_messages
+    WHERE saved_by_user_id = ?
+      AND message_id = ?;
+    """
+
     values = (
         saved_by_user_id,
         message_id,
@@ -806,10 +945,38 @@ async def save_unread_message(
     )
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
-        cursor = await database.execute(query, values)
-        await database.commit()
+        await database.execute("PRAGMA foreign_keys = ON;")
 
-        return cursor.rowcount == 1
+        try:
+            await database.execute("BEGIN;")
+            cursor = await database.execute(query, values)
+            was_inserted = cursor.rowcount == 1
+
+            if attachments:
+                cursor = await database.execute(
+                    get_saved_message_id_query,
+                    (
+                        saved_by_user_id,
+                        message_id,
+                    ),
+                )
+                row = await cursor.fetchone()
+
+                if row is None:
+                    raise RuntimeError("Failed to find saved message record")
+
+                await _insert_saved_message_attachments(
+                    database,
+                    saved_message_id=row[0],
+                    attachments=attachments,
+                )
+
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return was_inserted
     
 
 async def get_saved_messages(
@@ -852,6 +1019,106 @@ async def get_saved_messages(
         rows = await cursor.fetchall()
 
         return rows
+
+
+async def save_saved_message_attachments(
+    *,
+    saved_message_id: int,
+    saved_by_user_id: str,
+    attachments: Sequence[AttachmentToSave],
+) -> int:
+    if not attachments:
+        return 0
+
+    _validate_attachments(attachments)
+
+    owner_query = """
+    SELECT 1
+    FROM saved_messages
+    WHERE id = ?
+      AND saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        cursor = await database.execute(
+            owner_query,
+            (
+                saved_message_id,
+                saved_by_user_id,
+            ),
+        )
+
+        if await cursor.fetchone() is None:
+            return 0
+
+        try:
+            await database.execute("BEGIN;")
+            inserted_count = await _insert_saved_message_attachments(
+                database,
+                saved_message_id=saved_message_id,
+                attachments=attachments,
+            )
+
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return inserted_count
+
+
+async def get_attachments_for_saved_messages(
+    *,
+    saved_by_user_id: str,
+    saved_message_ids: list[int],
+) -> dict[int, list[aiosqlite.Row]]:
+    unique_message_ids = list(dict.fromkeys(saved_message_ids))
+
+    if not unique_message_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in unique_message_ids)
+    query = f"""
+    SELECT
+        attachment.saved_message_id,
+        attachment.attachment_id,
+        attachment.filename,
+        attachment.url,
+        attachment.proxy_url,
+        attachment.content_type,
+        attachment.size,
+        attachment.description,
+        attachment.width,
+        attachment.height,
+        attachment.position
+    FROM saved_message_attachments AS attachment
+    JOIN saved_messages AS saved_message
+      ON saved_message.id = attachment.saved_message_id
+    WHERE saved_message.saved_by_user_id = ?
+      AND attachment.saved_message_id IN ({placeholders})
+    ORDER BY attachment.saved_message_id, attachment.position;
+    """
+    values: list[str | int] = [
+        saved_by_user_id,
+        *unique_message_ids,
+    ]
+    attachments_by_message: dict[int, list[aiosqlite.Row]] = {
+        saved_message_id: []
+        for saved_message_id in unique_message_ids
+    }
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+
+        cursor = await database.execute(query, values)
+        rows = await cursor.fetchall()
+
+    for row in rows:
+        attachments_by_message[row["saved_message_id"]].append(row)
+
+    return attachments_by_message
 
 
 async def count_saved_messages(

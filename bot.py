@@ -5,6 +5,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from database import (
+    AttachmentToSave,
     MessageToSave,
     PendingRangeChangedError,
     count_saved_batches,
@@ -62,6 +63,26 @@ class RangeTooLargeError(ValueError):
     pass
 
 
+def prepare_attachments_to_save(
+    attachments: list[discord.Attachment],
+) -> tuple[AttachmentToSave, ...]:
+    return tuple(
+        AttachmentToSave(
+            attachment_id=str(attachment.id),
+            filename=attachment.filename,
+            url=attachment.url,
+            proxy_url=attachment.proxy_url,
+            content_type=attachment.content_type,
+            size=attachment.size,
+            description=attachment.description,
+            width=attachment.width,
+            height=attachment.height,
+            position=position,
+        )
+        for position, attachment in enumerate(attachments)
+    )
+
+
 async def get_messages_in_range(
     start_message: discord.Message,
     end_message: discord.Message,
@@ -115,6 +136,7 @@ def prepare_messages_to_save(
             jump_url=message.jump_url,
             message_created_at=message.created_at.isoformat(),
             position=position,
+            attachments=prepare_attachments_to_save(message.attachments),
         )
         for position, message in enumerate(messages)
     ]
@@ -375,6 +397,7 @@ async def save_as_unread(
         content=message.content,
         jump_url=message.jump_url,
         message_created_at=message.created_at.isoformat(),
+        attachments=prepare_attachments_to_save(message.attachments),
     )
 
     if was_inserted:
