@@ -17,6 +17,7 @@ class FakeInteraction:
         self.user = SimpleNamespace(id=user_id)
         self.response = SimpleNamespace(defer=AsyncMock())
         self.edit_original_response = AsyncMock()
+        self.followup = SimpleNamespace(send=AsyncMock())
 
 
 def batch_summary(
@@ -216,14 +217,32 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
             saved_message_ids=[70, 60],
         )
         interaction.edit_original_response.assert_awaited_once()
-        call = interaction.edit_original_response.await_args
-        embeds = call.kwargs["embeds"]
+        first_call = interaction.edit_original_response.await_args
+        followup_calls = interaction.followup.send.await_args_list
+        summary_calls = [first_call, *followup_calls]
+        embeds = [call.kwargs["embed"] for call in summary_calls]
+        views = [call.kwargs["view"] for call in summary_calls]
 
         self.assertEqual(
-            call.kwargs["content"],
+            first_call.kwargs["content"],
             "Your saved message batches — page 2/3",
         )
+        self.assertEqual(len(followup_calls), 2)
+        self.assertTrue(
+            all(call.kwargs["ephemeral"] for call in followup_calls)
+        )
         self.assertEqual(len(embeds), 3)
+        self.assertTrue(
+            all(isinstance(view, bot.BatchSummaryView) for view in views)
+        )
+        self.assertEqual([view.batch_id for view in views], [7, 6, 5])
+        self.assertEqual(
+            [view.owner_user_id for view in views],
+            [42, 42, 42],
+        )
+        self.assertFalse(views[0].view_batch.disabled)
+        self.assertFalse(views[1].view_batch.disabled)
+        self.assertTrue(views[2].view_batch.disabled)
         self.assertEqual(embeds[0].title, "Architecture")
         self.assertIn("First message by Author 7", embeds[0].description)
         self.assertIn(
@@ -264,7 +283,6 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
             "*This batch currently has no messages.*",
         )
         self.assertEqual(len(embeds[2].fields), 2)
-        self.assertNotIn("view", call.kwargs)
 
     async def test_full_page_stays_within_discord_embed_text_limit(
         self,
@@ -313,10 +331,14 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.show_saved_batches.callback(interaction)
 
-        embeds = interaction.edit_original_response.await_args.kwargs["embeds"]
+        summary_calls = [
+            interaction.edit_original_response.await_args,
+            *interaction.followup.send.await_args_list,
+        ]
+        embeds = [call.kwargs["embed"] for call in summary_calls]
 
         self.assertEqual(len(embeds), 5)
-        self.assertLessEqual(sum(len(embed) for embed in embeds), 6000)
+        self.assertTrue(all(len(embed) <= 6000 for embed in embeds))
         self.assertTrue(
             all(
                 len(embed.fields[2].value)

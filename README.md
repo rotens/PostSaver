@@ -87,13 +87,10 @@ Range behavior:
 The pending range start is stored in SQLite and survives bot restarts. Selecting
 another start replaces the previous one.
 
-Batch data can be listed, but there is not yet a batch-detail or management
-interface.
-
-### Viewing batch summaries
+### Viewing saved batches
 
 `/batches page:<number>` displays five read-only batch summaries per page,
-newest first. Each summary contains:
+newest first. Every summary has its own `View batch` button and contains:
 
 - the batch title, or an `Untitled batch #<id>` fallback;
 - the batch creation time;
@@ -101,8 +98,15 @@ newest first. Each summary contains:
 - a preview and direct link for the first remaining message;
 - attachment links and the first image preview from that first message.
 
-Empty batches remain visible. The command does not yet open the complete batch
-or provide rename, delete, or status controls.
+`View batch` opens a separate ephemeral detail response with five messages per
+page. Detail pages preserve the batch order and show each message's author,
+text, creation time, current status, attachments, image preview, position in
+the batch, and original-message link. `Previous` and `Next` edit the detail
+response in place, and the unavailable boundary action is disabled.
+
+Empty batches remain visible, but their `View batch` button is disabled. Batch
+summaries and details are currently read-only: they do not provide rename,
+delete, or batch-level status controls.
 
 ### Attachments
 
@@ -111,10 +115,11 @@ including the filename, Discord URLs, media type, byte size, optional alt text,
 dimensions, and original order.
 
 `/saved` lists the attachments belonging to each displayed record. `/batches`
-lists attachments only for the first remaining message used by each batch
-summary. The first image attachment is shown as the embed image; other images
-and non-image files remain links. Long attachment lists are shortened with an
-omitted-item count to stay within Discord embed limits.
+lists attachments for the first remaining message in each summary and for
+every message shown on a batch-detail page. The first image attachment is shown
+as the embed image; other images and non-image files remain links. Long
+attachment lists are shortened with an omitted-item count to stay within
+Discord embed limits.
 
 The bot stores metadata and URLs, not the attachment file contents. It is not
 an attachment archive: a stored URL can eventually stop working if the
@@ -234,7 +239,7 @@ place and only replace or clear its data.
 | Command | Purpose |
 |---|---|
 | `/saved` | Display the user's saved messages with status and page options. |
-| `/batches` | Display paginated, read-only saved-batch summaries. |
+| `/batches` | Display paginated batch summaries with read-only message details. |
 | `/ignore_user` | Ignore messages written by a selected user. |
 | `/unignore_user` | Remove one user from the ignore list. |
 | `/unignore_all` | Reset the user's ignore list. |
@@ -296,7 +301,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 94 tests covering:
+The current suite contains 108 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
 - attachment schema, metadata conversion, ordering, validation, ownership,
@@ -310,7 +315,8 @@ The current suite contains 94 tests covering:
 - pending-range creation, replacement, isolation, and deletion;
 - batch creation, ownership, ordering, associations, summaries, and
   paginated contents;
-- `/batches` empty states, page validation, and summary rendering;
+- `/batches` empty states, page validation, per-summary views, detail opening,
+  detail pagination, ownership, attachment rendering, and embed limits;
 - inclusive and reverse-direction history retrieval;
 - the 1,000-message scan limit and 300-message saved-message limit;
 - ignored-author filtering;
@@ -343,12 +349,10 @@ data/reading_manager.db
 
 ## Current limitations
 
-- Saved batches can be listed, but cannot yet be opened, renamed, or deleted
-  through Discord.
+- Saved batches cannot yet be renamed or deleted through Discord.
 - `/saved` cannot yet filter by author, channel, server, date, or keywords.
 - Attachment files are not downloaded or archived; views depend on stored
   Discord URLs remaining available.
-- Messages inside a batch do not yet have a dedicated batch-detail view.
 - Batch-level status changes are not implemented.
 - Persistent Discord views across bot restarts are not implemented.
 - A selected range can currently span at most 1,000 Discord messages, and each

@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 
 import discord
 from discord import app_commands
@@ -9,6 +10,7 @@ from database import (
     MessageToSave,
     PendingRangeChangedError,
     count_saved_batches,
+    count_saved_messages_in_batch,
     count_saved_messages,
     delete_pending_range_if_matches,
     delete_saved_message,
@@ -16,6 +18,7 @@ from database import (
     get_attachments_for_saved_messages,
     get_pending_range,
     get_saved_batches,
+    get_saved_messages_in_batch,
     get_saved_messages,
     ignore_user,
     initialize_database,
@@ -34,7 +37,9 @@ load_dotenv()
 
 SAVED_MESSAGES_PAGE_SIZE = 5
 SAVED_BATCHES_PAGE_SIZE = 5
+BATCH_DETAIL_PAGE_SIZE = 5
 BATCH_PREVIEW_CONTENT_LIMIT = 350
+BATCH_DETAIL_CONTENT_LIMIT = 400
 SAVED_ATTACHMENT_FIELD_VALUE_LIMIT = 1024
 BATCH_ATTACHMENT_FIELD_VALUE_LIMIT = 400
 MAX_RANGE_MESSAGES_TO_SCAN = 1000
@@ -64,6 +69,14 @@ bot = ReadingBot()
 
 class RangeTooLargeError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class SavedBatchDetailPage:
+    current_page: int
+    total_pages: int
+    total_messages: int
+    embeds: tuple[discord.Embed, ...]
 
 
 def prepare_attachments_to_save(
@@ -900,6 +913,311 @@ def create_saved_batch_summary_embed(
     return embed
 
 
+def get_saved_batch_display_title(
+    *,
+    batch_id: int,
+    title: str | None,
+) -> str:
+    return title or f"Untitled batch #{batch_id}"
+
+
+def create_saved_batch_message_embed(
+    row,
+    *,
+    attachments,
+    message_number: int,
+    total_messages: int,
+    page: int,
+    total_pages: int,
+) -> discord.Embed:
+    content = row["content"].strip()
+
+    if not content:
+        if attachments:
+            content = (
+                "*This message has no text content; "
+                "attachments are listed below.*"
+            )
+        else:
+            content = "*Message has no text content.*"
+
+    if len(content) > BATCH_DETAIL_CONTENT_LIMIT:
+        content = content[: BATCH_DETAIL_CONTENT_LIMIT - 3] + "..."
+
+    embed = discord.Embed(
+        title=row["author_name"],
+        description=(
+            f"{content}\n\n"
+            f'[Open message]({row["jump_url"]})'
+        ),
+    )
+    embed.add_field(
+        name="Created",
+        value=row["message_created_at"],
+        inline=False,
+    )
+    add_attachments_to_embed(
+        embed,
+        attachments,
+        field_value_limit=BATCH_ATTACHMENT_FIELD_VALUE_LIMIT,
+    )
+    embed.set_footer(
+        text=(
+            f'Status: {row["status"]} | '
+            f"Message {message_number}/{total_messages} | "
+            f"Page {page}/{total_pages}"
+        )
+    )
+
+    return embed
+
+
+async def get_saved_batch_detail_page(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+    requested_page: int,
+) -> SavedBatchDetailPage | None:
+    if requested_page < 1:
+        raise ValueError("Page number must be at least 1")
+
+    total_messages = await count_saved_messages_in_batch(
+        batch_id=batch_id,
+        saved_by_user_id=saved_by_user_id,
+    )
+
+    if total_messages == 0:
+        return None
+
+    total_pages = (
+        total_messages + BATCH_DETAIL_PAGE_SIZE - 1
+    ) // BATCH_DETAIL_PAGE_SIZE
+    current_page = min(requested_page, total_pages)
+    offset = (current_page - 1) * BATCH_DETAIL_PAGE_SIZE
+    rows = await get_saved_messages_in_batch(
+        batch_id=batch_id,
+        saved_by_user_id=saved_by_user_id,
+        limit=BATCH_DETAIL_PAGE_SIZE,
+        offset=offset,
+    )
+    attachments_by_message = await get_attachments_for_saved_messages(
+        saved_by_user_id=saved_by_user_id,
+        saved_message_ids=[row["id"] for row in rows],
+    )
+    embeds = tuple(
+        create_saved_batch_message_embed(
+            row,
+            attachments=attachments_by_message.get(row["id"], []),
+            message_number=offset + index + 1,
+            total_messages=total_messages,
+            page=current_page,
+            total_pages=total_pages,
+        )
+        for index, row in enumerate(rows)
+    )
+
+    return SavedBatchDetailPage(
+        current_page=current_page,
+        total_pages=total_pages,
+        total_messages=total_messages,
+        embeds=embeds,
+    )
+
+
+def create_saved_batch_detail_header(
+    *,
+    batch_id: int,
+    title: str | None,
+    page: SavedBatchDetailPage,
+) -> str:
+    display_title = get_saved_batch_display_title(
+        batch_id=batch_id,
+        title=title,
+    )
+
+    return (
+        f"Batch: **{discord.utils.escape_markdown(display_title)}** — "
+        f"page {page.current_page}/{page.total_pages}"
+    )
+
+
+class BatchDetailView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        batch_id: int,
+        owner_user_id: int,
+        title: str | None,
+        current_page: int,
+        total_pages: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.batch_id = batch_id
+        self.owner_user_id = owner_user_id
+        self.title = title
+        self.current_page = current_page
+        self.total_pages = total_pages
+        self.refresh_buttons()
+
+    def refresh_buttons(self) -> None:
+        self.previous_page.disabled = self.current_page <= 1
+        self.next_page.disabled = self.current_page >= self.total_pages
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+
+        await interaction.response.send_message(
+            "This batch-detail view belongs to another user.",
+            ephemeral=True,
+        )
+        return False
+
+    async def show_page(
+        self,
+        interaction: discord.Interaction,
+        requested_page: int,
+    ) -> None:
+        await interaction.response.defer()
+        page = await get_saved_batch_detail_page(
+            batch_id=self.batch_id,
+            saved_by_user_id=str(self.owner_user_id),
+            requested_page=requested_page,
+        )
+
+        if page is None:
+            self.stop()
+            await interaction.edit_original_response(
+                content="This batch no longer contains any saved messages.",
+                embeds=[],
+                view=None,
+            )
+            return
+
+        self.current_page = page.current_page
+        self.total_pages = page.total_pages
+        self.refresh_buttons()
+
+        await interaction.edit_original_response(
+            content=create_saved_batch_detail_header(
+                batch_id=self.batch_id,
+                title=self.title,
+                page=page,
+            ),
+            embeds=list(page.embeds),
+            view=self,
+        )
+
+    @discord.ui.button(
+        label="Previous",
+        style=discord.ButtonStyle.secondary,
+        custom_id="batch_detail:previous",
+    )
+    async def previous_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.show_page(interaction, self.current_page - 1)
+
+    @discord.ui.button(
+        label="Next",
+        style=discord.ButtonStyle.primary,
+        custom_id="batch_detail:next",
+    )
+    async def next_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.show_page(interaction, self.current_page + 1)
+
+
+async def open_saved_batch_detail(
+    interaction: discord.Interaction,
+    *,
+    batch_id: int,
+    title: str | None,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    page = await get_saved_batch_detail_page(
+        batch_id=batch_id,
+        saved_by_user_id=str(interaction.user.id),
+        requested_page=1,
+    )
+
+    if page is None:
+        await interaction.edit_original_response(
+            content="This batch no longer contains any saved messages.",
+        )
+        return
+
+    view = BatchDetailView(
+        batch_id=batch_id,
+        owner_user_id=interaction.user.id,
+        title=title,
+        current_page=page.current_page,
+        total_pages=page.total_pages,
+    )
+    await interaction.edit_original_response(
+        content=create_saved_batch_detail_header(
+            batch_id=batch_id,
+            title=title,
+            page=page,
+        ),
+        embeds=list(page.embeds),
+        view=view,
+    )
+
+
+class BatchSummaryView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        batch_id: int,
+        owner_user_id: int,
+        title: str | None,
+        message_count: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.batch_id = batch_id
+        self.owner_user_id = owner_user_id
+        self.title = title
+        self.view_batch.disabled = message_count == 0
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+
+        await interaction.response.send_message(
+            "This batch-summary panel belongs to another user.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="View batch",
+        style=discord.ButtonStyle.primary,
+        custom_id="batch_summary:view",
+    )
+    async def view_batch(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await open_saved_batch_detail(
+            interaction,
+            batch_id=self.batch_id,
+            title=self.title,
+        )
+
+
 @bot.tree.command(
     name="batches",
     description="Show summaries of your saved message batches",
@@ -950,8 +1268,8 @@ async def show_saved_batches(
         saved_by_user_id=str(interaction.user.id),
         saved_message_ids=first_message_record_ids,
     )
-    embeds = [
-        create_saved_batch_summary_embed(
+    for index, row in enumerate(rows):
+        embed = create_saved_batch_summary_embed(
             row,
             attachments=attachments_by_message.get(
                 row["first_message_record_id"],
@@ -960,13 +1278,28 @@ async def show_saved_batches(
             page=page,
             total_pages=total_pages,
         )
-        for row in rows
-    ]
+        view = BatchSummaryView(
+            batch_id=row["id"],
+            owner_user_id=interaction.user.id,
+            title=row["title"],
+            message_count=row["message_count"],
+        )
 
-    await interaction.edit_original_response(
-        content=f"Your saved message batches — page {page}/{total_pages}",
-        embeds=embeds,
-    )
+        if index == 0:
+            await interaction.edit_original_response(
+                content=(
+                    "Your saved message batches — "
+                    f"page {page}/{total_pages}"
+                ),
+                embed=embed,
+                view=view,
+            )
+        else:
+            await interaction.followup.send(
+                embed=embed,
+                view=view,
+                ephemeral=True,
+            )
 
 
 @bot.tree.command(
