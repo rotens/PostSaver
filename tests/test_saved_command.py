@@ -15,6 +15,9 @@ with patch.object(discord.Client, "run"):
 class FakeInteraction:
     def __init__(self, user_id: int = 42) -> None:
         self.user = SimpleNamespace(id=user_id)
+        self.guild_id = 10
+        self.channel_id = 20
+        self.namespace = SimpleNamespace()
         self.response = SimpleNamespace(defer=AsyncMock())
         self.followup = SimpleNamespace(send=AsyncMock())
         self.edit_original_response = AsyncMock()
@@ -25,9 +28,16 @@ def saved_row(
     record_id: int,
     content: str,
     status: str = "UNREAD",
+    guild_id: str | None = "10",
+    guild_name: str | None = "Test Guild",
+    channel_name: str | None = "general",
 ) -> dict[str, object]:
     return {
         "id": record_id,
+        "guild_id": guild_id,
+        "guild_name": guild_name,
+        "channel_id": "20",
+        "channel_name": channel_name,
         "author_name": f"Author {record_id}",
         "content": content,
         "jump_url": f"https://discord.test/{record_id}",
@@ -62,6 +72,37 @@ def attachment_row(
 
 
 class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_location_display_uses_ids_for_old_records(self) -> None:
+        embed = discord.Embed()
+
+        bot.add_location_to_embed(
+            embed,
+            guild_id="10",
+            guild_name=None,
+            channel_id="20",
+            channel_name=None,
+        )
+
+        self.assertEqual(embed.fields[0].value, "ID: 10")
+        self.assertEqual(embed.fields[1].value, "ID: 20")
+
+    def test_location_display_handles_direct_messages(self) -> None:
+        embed = discord.Embed()
+
+        bot.add_location_to_embed(
+            embed,
+            guild_id=None,
+            guild_name=None,
+            channel_id="20",
+            channel_name="Direct Message with Alice",
+        )
+
+        self.assertEqual(embed.fields[0].value, "Direct message")
+        self.assertEqual(
+            embed.fields[1].value,
+            "Direct Message with Alice",
+        )
+
     async def test_default_filter_reports_no_unread_messages(self) -> None:
         interaction = FakeInteraction()
 
@@ -82,11 +123,19 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         count_messages.assert_awaited_once_with(
             saved_by_user_id="42",
-            status="UNREAD",
+            filters=bot.SavedMessageFilters(
+                status="UNREAD",
+                channel_id="20",
+                guild_id="10",
+            ),
         )
         get_messages.assert_not_awaited()
         interaction.edit_original_response.assert_awaited_once_with(
-            content="You have no saved messages with status `UNREAD`.",
+            content=(
+                "No saved messages match these filters.\n"
+                "Active filters: Status: `UNREAD` • Channel: <#20> • "
+                "Server ID: `10`"
+            ),
         )
 
     async def test_page_above_filtered_total_is_rejected(self) -> None:
@@ -115,7 +164,9 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
         interaction.edit_original_response.assert_awaited_once_with(
             content=(
                 "Page `3` does not exist. "
-                "You have 2 page(s) with status `READ_KEEP`."
+                "The filtered results have 2 page(s).\n"
+                "Active filters: Status: `READ_KEEP` • Channel: <#20> • "
+                "Server ID: `10`"
             ),
         )
 
@@ -178,7 +229,11 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
 
         get_messages.assert_awaited_once_with(
             saved_by_user_id="42",
-            status="ALL",
+            filters=bot.SavedMessageFilters(
+                status="ALL",
+                channel_id="20",
+                guild_id="10",
+            ),
             limit=5,
             offset=5,
         )
@@ -190,6 +245,14 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
         interaction.followup.send.assert_awaited_once()
 
         first_call = interaction.edit_original_response.await_args
+        self.assertEqual(
+            first_call.kwargs["content"],
+            (
+                "Saved messages — page 2/3\n"
+                "Active filters: Status: `ALL` • Channel: <#20> • "
+                "Server ID: `10`"
+            ),
+        )
         first_embed = first_call.kwargs["embed"]
         first_view = first_call.kwargs["view"]
         second_call = interaction.followup.send.await_args
@@ -203,14 +266,18 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
                 "attachments are listed below.*"
             ),
         )
-        self.assertEqual(first_embed.fields[1].name, "Attachments (2)")
+        self.assertEqual(first_embed.fields[1].name, "Server")
+        self.assertEqual(first_embed.fields[1].value, "Test Guild")
+        self.assertEqual(first_embed.fields[2].name, "Channel")
+        self.assertEqual(first_embed.fields[2].value, "#general")
+        self.assertEqual(first_embed.fields[3].name, "Attachments (2)")
         self.assertIn(
             "[diagram.png](https://cdn.discord.test/image-1) — 2 KiB",
-            first_embed.fields[1].value,
+            first_embed.fields[3].value,
         )
         self.assertIn(
             "[notes.pdf](https://cdn.discord.test/file-1) — 4 KiB",
-            first_embed.fields[1].value,
+            first_embed.fields[3].value,
         )
         self.assertEqual(
             first_embed.image.url,
@@ -219,7 +286,7 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_embed.footer.text, "Status: UNREAD | Page 2/3")
         self.assertEqual(len(second_embed.description), 1000)
         self.assertTrue(second_embed.description.endswith("..."))
-        self.assertEqual(len(second_embed.fields), 1)
+        self.assertEqual(len(second_embed.fields), 3)
         self.assertEqual(
             second_embed.footer.text,
             "Status: READ_KEEP | Page 2/3",
@@ -278,7 +345,7 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
             await bot.show_saved_messages.callback(interaction)
 
         embed = interaction.edit_original_response.await_args.kwargs["embed"]
-        attachment_field = embed.fields[1]
+        attachment_field = embed.fields[3]
 
         self.assertLessEqual(
             len(attachment_field.value),

@@ -33,7 +33,20 @@ class MessageToSave:
     jump_url: str
     message_created_at: str
     position: int
+    guild_name: str | None = None
+    channel_name: str | None = None
     attachments: tuple[AttachmentToSave, ...] = ()
+
+
+@dataclass(frozen=True)
+class SavedMessageFilters:
+    status: str = "UNREAD"
+    keyword: str | None = None
+    created_from: str | None = None
+    created_before: str | None = None
+    author_id: str | None = None
+    channel_id: str | None = None
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,7 +68,9 @@ CREATE TABLE IF NOT EXISTS saved_messages (
 
     message_id TEXT NOT NULL,
     guild_id TEXT,
+    guild_name TEXT,
     channel_id TEXT NOT NULL,
+    channel_name TEXT,
 
     author_id TEXT NOT NULL,
     author_name TEXT NOT NULL,
@@ -154,12 +169,38 @@ ON saved_batch_messages (saved_message_id);
 """
 
 
+SAVED_MESSAGE_LOCATION_COLUMNS = {
+    "guild_name": "TEXT",
+    "channel_name": "TEXT",
+}
+
+
+async def _add_missing_saved_message_location_columns(
+    database: aiosqlite.Connection,
+) -> None:
+    cursor = await database.execute("PRAGMA table_info(saved_messages);")
+    existing_columns = {
+        row[1]
+        for row in await cursor.fetchall()
+    }
+
+    for column_name, column_type in SAVED_MESSAGE_LOCATION_COLUMNS.items():
+        if column_name in existing_columns:
+            continue
+
+        await database.execute(
+            f"ALTER TABLE saved_messages "
+            f"ADD COLUMN {column_name} {column_type};"
+        )
+
+
 async def initialize_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
         await database.execute("PRAGMA foreign_keys = ON;")
         await database.execute(CREATE_SAVED_MESSAGES_TABLE)
+        await _add_missing_saved_message_location_columns(database)
         await database.execute(CREATE_SAVED_MESSAGE_ATTACHMENTS_TABLE)
         await database.execute(CREATE_IGNORED_USERS_TABLE)
         await database.execute(CREATE_PENDING_RANGES_TABLE)
@@ -490,6 +531,10 @@ async def get_saved_batches(
         saved_batch.created_at,
         COALESCE(batch_stats.message_count, 0) AS message_count,
         first_message.id AS first_message_record_id,
+        first_message.guild_id AS first_message_guild_id,
+        first_message.guild_name AS first_message_guild_name,
+        first_message.channel_id AS first_message_channel_id,
+        first_message.channel_name AS first_message_channel_name,
         first_message.author_name AS first_message_author_name,
         first_message.content AS first_message_content,
         first_message.jump_url AS first_message_jump_url,
@@ -565,6 +610,10 @@ async def get_saved_messages_in_batch(
     query = """
     SELECT
         saved_message.id,
+        saved_message.guild_id,
+        saved_message.guild_name,
+        saved_message.channel_id,
+        saved_message.channel_name,
         saved_message.author_name,
         saved_message.content,
         saved_message.jump_url,
@@ -645,7 +694,9 @@ async def save_message_range_as_batch(
         saved_by_user_id,
         message_id,
         guild_id,
+        guild_name,
         channel_id,
+        channel_name,
         author_id,
         author_name,
         content,
@@ -653,7 +704,7 @@ async def save_message_range_as_batch(
         message_created_at,
         status
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
     """
 
     get_saved_message_id_query = """
@@ -718,7 +769,9 @@ async def save_message_range_as_batch(
                         saved_by_user_id,
                         message.message_id,
                         message.guild_id,
+                        message.guild_name,
                         message.channel_id,
+                        message.channel_name,
                         message.author_id,
                         message.author_name,
                         message.content,
@@ -905,6 +958,8 @@ async def save_unread_message(
     content: str,
     jump_url: str,
     message_created_at: str,
+    guild_name: str | None = None,
+    channel_name: str | None = None,
     attachments: Sequence[AttachmentToSave] = (),
 ) -> bool:
     _validate_attachments(attachments)
@@ -914,7 +969,9 @@ async def save_unread_message(
         saved_by_user_id,
         message_id,
         guild_id,
+        guild_name,
         channel_id,
+        channel_name,
         author_id,
         author_name,
         content,
@@ -922,7 +979,7 @@ async def save_unread_message(
         message_created_at,
         status
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
     """
 
     get_saved_message_id_query = """
@@ -936,7 +993,9 @@ async def save_unread_message(
         saved_by_user_id,
         message_id,
         guild_id,
+        guild_name,
         channel_id,
+        channel_name,
         author_id,
         author_name,
         content,
@@ -977,35 +1036,88 @@ async def save_unread_message(
             raise
 
     return was_inserted
-    
+
+
+def _escape_like_keyword(keyword: str) -> str:
+    return (
+        keyword
+        .replace("!", "!!")
+        .replace("%", "!%")
+        .replace("_", "!_")
+    )
+
+
+def _build_saved_message_filter_clause(
+    *,
+    saved_by_user_id: str,
+    filters: SavedMessageFilters,
+    table_alias: str = "saved_message",
+) -> tuple[str, list[str | int]]:
+    conditions = [f"{table_alias}.saved_by_user_id = ?"]
+    values: list[str | int] = [saved_by_user_id]
+
+    if filters.status != "ALL":
+        conditions.append(f"{table_alias}.status = ?")
+        values.append(filters.status)
+
+    if filters.keyword is not None:
+        escaped_keyword = _escape_like_keyword(filters.keyword)
+        conditions.append(
+            f"LOWER({table_alias}.content) "
+            "LIKE LOWER(?) ESCAPE '!'"
+        )
+        values.append(f"%{escaped_keyword}%")
+
+    if filters.created_from is not None:
+        conditions.append(f"{table_alias}.message_created_at >= ?")
+        values.append(filters.created_from)
+
+    if filters.created_before is not None:
+        conditions.append(f"{table_alias}.message_created_at < ?")
+        values.append(filters.created_before)
+
+    if filters.author_id is not None:
+        conditions.append(f"{table_alias}.author_id = ?")
+        values.append(filters.author_id)
+
+    if filters.channel_id is not None:
+        conditions.append(f"{table_alias}.channel_id = ?")
+        values.append(filters.channel_id)
+
+    if filters.guild_id is not None:
+        conditions.append(f"{table_alias}.guild_id = ?")
+        values.append(filters.guild_id)
+
+    return " AND ".join(conditions), values
+
 
 async def get_saved_messages(
     *,
     saved_by_user_id: str,
-    status: str = "UNREAD",
+    filters: SavedMessageFilters | None = None,
     limit: int = 10,
     offset: int = 0,
 ) -> list[aiosqlite.Row]:
-    query = """
+    selected_filters = filters or SavedMessageFilters()
+    where_clause, values = _build_saved_message_filter_clause(
+        saved_by_user_id=saved_by_user_id,
+        filters=selected_filters,
+    )
+    query = f"""
     SELECT
-        id,
-        author_name,
-        content,
-        jump_url,
-        message_created_at,
-        status
-    FROM saved_messages
-    WHERE saved_by_user_id = ?
-    """
-
-    values: list[str | int] = [saved_by_user_id]
-
-    if status != "ALL":
-        query += " AND status = ?"
-        values.append(status)
-
-    query += """
-    ORDER BY saved_at DESC, id DESC
+        saved_message.id,
+        saved_message.guild_id,
+        saved_message.guild_name,
+        saved_message.channel_id,
+        saved_message.channel_name,
+        saved_message.author_name,
+        saved_message.content,
+        saved_message.jump_url,
+        saved_message.message_created_at,
+        saved_message.status
+    FROM saved_messages AS saved_message
+    WHERE {where_clause}
+    ORDER BY saved_message.saved_at DESC, saved_message.id DESC
     LIMIT ? OFFSET ?
     """
 
@@ -1076,26 +1188,187 @@ async def get_attachments_for_saved_messages(
 async def count_saved_messages(
     *,
     saved_by_user_id: str,
-    status: str = "UNREAD",
+    filters: SavedMessageFilters | None = None,
 ) -> int:
-    query = """
+    selected_filters = filters or SavedMessageFilters()
+    where_clause, values = _build_saved_message_filter_clause(
+        saved_by_user_id=saved_by_user_id,
+        filters=selected_filters,
+    )
+    query = f"""
     SELECT COUNT(*)
-    FROM saved_messages
-    WHERE saved_by_user_id = ?
+    FROM saved_messages AS saved_message
+    WHERE {where_clause};
     """
-
-    values = [saved_by_user_id]
-
-    if status != "ALL":
-        query += " AND status = ?"
-        values.append(status)
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
         cursor = await database.execute(query, values)
         row = await cursor.fetchone()
 
         return row[0]
-    
+
+
+def _validate_autocomplete_limit(limit: int) -> None:
+    if not 1 <= limit <= 25:
+        raise ValueError("Autocomplete limit must be between 1 and 25")
+
+
+def _autocomplete_like_pattern(current: str) -> str:
+    return f"%{_escape_like_keyword(current.strip())}%"
+
+
+async def get_saved_author_autocomplete_choices(
+    *,
+    saved_by_user_id: str,
+    current: str,
+    limit: int = 25,
+) -> list[aiosqlite.Row]:
+    _validate_autocomplete_limit(limit)
+    query = """
+    WITH latest_author_names AS (
+        SELECT
+            author_id,
+            author_name,
+            ROW_NUMBER() OVER (
+                PARTITION BY author_id
+                ORDER BY saved_at DESC, id DESC
+            ) AS row_number
+        FROM saved_messages
+        WHERE saved_by_user_id = ?
+    )
+    SELECT author_id, author_name
+    FROM latest_author_names
+    WHERE row_number = 1
+      AND (
+          LOWER(author_name) LIKE LOWER(?) ESCAPE '!'
+          OR author_id LIKE ? ESCAPE '!'
+      )
+    ORDER BY author_name COLLATE NOCASE, author_id
+    LIMIT ?;
+    """
+    pattern = _autocomplete_like_pattern(current)
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                pattern,
+                pattern,
+                limit,
+            ),
+        )
+
+        return await cursor.fetchall()
+
+
+async def get_saved_channel_autocomplete_choices(
+    *,
+    saved_by_user_id: str,
+    current: str,
+    guild_id: str | None = None,
+    limit: int = 25,
+) -> list[aiosqlite.Row]:
+    _validate_autocomplete_limit(limit)
+    conditions = ["saved_by_user_id = ?"]
+    values: list[str | int] = [saved_by_user_id]
+
+    if guild_id is not None:
+        conditions.append("guild_id = ?")
+        values.append(guild_id)
+
+    query = f"""
+    WITH latest_channel_names AS (
+        SELECT
+            channel_id,
+            channel_name,
+            guild_id,
+            guild_name,
+            ROW_NUMBER() OVER (
+                PARTITION BY channel_id
+                ORDER BY saved_at DESC, id DESC
+            ) AS row_number
+        FROM saved_messages
+        WHERE {' AND '.join(conditions)}
+    )
+    SELECT
+        channel_id,
+        channel_name,
+        guild_id,
+        guild_name
+    FROM latest_channel_names
+    WHERE row_number = 1
+      AND (
+          LOWER(COALESCE(channel_name, ''))
+              LIKE LOWER(?) ESCAPE '!'
+          OR channel_id LIKE ? ESCAPE '!'
+          OR LOWER(COALESCE(guild_name, ''))
+              LIKE LOWER(?) ESCAPE '!'
+      )
+    ORDER BY
+        COALESCE(guild_name, '') COLLATE NOCASE,
+        COALESCE(channel_name, channel_id) COLLATE NOCASE,
+        channel_id
+    LIMIT ?;
+    """
+    pattern = _autocomplete_like_pattern(current)
+    values.extend((pattern, pattern, pattern, limit))
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+        cursor = await database.execute(query, values)
+
+        return await cursor.fetchall()
+
+
+async def get_saved_guild_autocomplete_choices(
+    *,
+    saved_by_user_id: str,
+    current: str,
+    limit: int = 25,
+) -> list[aiosqlite.Row]:
+    _validate_autocomplete_limit(limit)
+    query = """
+    WITH latest_guild_names AS (
+        SELECT
+            guild_id,
+            guild_name,
+            ROW_NUMBER() OVER (
+                PARTITION BY guild_id
+                ORDER BY saved_at DESC, id DESC
+            ) AS row_number
+        FROM saved_messages
+        WHERE saved_by_user_id = ?
+          AND guild_id IS NOT NULL
+    )
+    SELECT guild_id, guild_name
+    FROM latest_guild_names
+    WHERE row_number = 1
+      AND (
+          LOWER(COALESCE(guild_name, ''))
+              LIKE LOWER(?) ESCAPE '!'
+          OR guild_id LIKE ? ESCAPE '!'
+      )
+    ORDER BY COALESCE(guild_name, guild_id) COLLATE NOCASE, guild_id
+    LIMIT ?;
+    """
+    pattern = _autocomplete_like_pattern(current)
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                pattern,
+                pattern,
+                limit,
+            ),
+        )
+
+        return await cursor.fetchall()
+
 
 VALID_STATUSES = {"UNREAD", "READ_KEEP"}
 

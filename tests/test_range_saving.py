@@ -31,7 +31,9 @@ class RangeSavingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         return database.MessageToSave(
             message_id=message_id,
             guild_id="guild-1",
+            guild_name="Guild One",
             channel_id="channel-1",
+            channel_name="general",
             author_id=f"author-{message_id}",
             author_name=f"Author {message_id}",
             content=content,
@@ -77,7 +79,11 @@ class RangeSavingDatabaseTests(unittest.IsolatedAsyncioTestCase):
             "SELECT id, saved_by_user_id, title FROM saved_batches;"
         )
         saved_messages = await self.fetch_all(
-            "SELECT message_id, status FROM saved_messages ORDER BY id;"
+            """
+            SELECT message_id, guild_name, channel_name, status
+            FROM saved_messages
+            ORDER BY id;
+            """
         )
         associations = await self.fetch_all(
             """
@@ -98,9 +104,9 @@ class RangeSavingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             saved_messages,
             [
-                ("message-1", "UNREAD"),
-                ("message-2", "UNREAD"),
-                ("message-3", "UNREAD"),
+                ("message-1", "Guild One", "general", "UNREAD"),
+                ("message-2", "Guild One", "general", "UNREAD"),
+                ("message-3", "Guild One", "general", "UNREAD"),
             ],
         )
         self.assertEqual(

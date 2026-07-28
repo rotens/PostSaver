@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -9,6 +10,7 @@ from database import (
     AttachmentToSave,
     MessageToSave,
     PendingRangeChangedError,
+    SavedMessageFilters,
     count_saved_batches,
     count_saved_messages_in_batch,
     count_saved_messages,
@@ -17,7 +19,10 @@ from database import (
     get_ignored_user_ids,
     get_attachments_for_saved_messages,
     get_pending_range,
+    get_saved_author_autocomplete_choices,
     get_saved_batches,
+    get_saved_channel_autocomplete_choices,
+    get_saved_guild_autocomplete_choices,
     get_saved_messages_in_batch,
     get_saved_messages,
     ignore_user,
@@ -52,7 +57,18 @@ class ReadingBot(discord.Client):
         intents.message_content = True
 
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = app_commands.CommandTree(
+            self,
+            allowed_installs=app_commands.AppInstallationType(
+                guild=True,
+                user=True,
+            ),
+            allowed_contexts=app_commands.AppCommandContext(
+                guild=True,
+                dm_channel=True,
+                private_channel=True,
+            ),
+        )
 
     async def setup_hook(self) -> None:
         print("setup_hook started")
@@ -79,6 +95,197 @@ class SavedBatchDetailPage:
     embeds: tuple[discord.Embed, ...]
 
 
+def _parse_date_filter(
+    value: str | None,
+    *,
+    field_name: str,
+) -> date | None:
+    if value is None:
+        return None
+
+    normalized_value = value.strip()
+
+    try:
+        parsed_date = date.fromisoformat(normalized_value)
+    except ValueError as error:
+        raise ValueError(
+            f"`{field_name}` must use the `YYYY-MM-DD` format."
+        ) from error
+
+    if parsed_date.isoformat() != normalized_value:
+        raise ValueError(
+            f"`{field_name}` must use the `YYYY-MM-DD` format."
+        )
+
+    return parsed_date
+
+
+def parse_saved_message_date_range(
+    *,
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str | None, str | None]:
+    parsed_from = _parse_date_filter(date_from, field_name="date_from")
+    parsed_to = _parse_date_filter(date_to, field_name="date_to")
+
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise ValueError("`date_from` cannot be later than `date_to`.")
+
+    created_from = (
+        datetime.combine(parsed_from, time.min, tzinfo=timezone.utc)
+        .isoformat()
+        if parsed_from
+        else None
+    )
+
+    if parsed_to:
+        try:
+            day_after_to = parsed_to + timedelta(days=1)
+        except OverflowError as error:
+            raise ValueError(
+                "`date_to` must be earlier than `9999-12-31`."
+            ) from error
+
+        created_before = datetime.combine(
+            day_after_to,
+            time.min,
+            tzinfo=timezone.utc,
+        ).isoformat()
+    else:
+        created_before = None
+
+    return created_from, created_before
+
+
+def _normalize_discord_id(
+    value: str | None,
+    *,
+    field_name: str,
+) -> str | None:
+    if value is None:
+        return None
+
+    normalized_value = value.strip()
+
+    if not normalized_value.isdecimal():
+        raise ValueError(f"`{field_name}` must be a Discord ID.")
+
+    return normalized_value
+
+
+def create_saved_message_filters(
+    *,
+    selected_status: str,
+    keyword: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    author_id: str | None,
+    guild_id: str | None,
+    channel_id: str | None,
+    all_locations: bool,
+    current_guild_id: int | None,
+    current_channel_id: int | None,
+) -> SavedMessageFilters:
+    normalized_author_id = _normalize_discord_id(
+        author_id,
+        field_name="author_id",
+    )
+    normalized_guild_id = _normalize_discord_id(
+        guild_id,
+        field_name="guild_id",
+    )
+    normalized_channel_id = _normalize_discord_id(
+        channel_id,
+        field_name="channel_id",
+    )
+
+    if all_locations and (
+        normalized_guild_id is not None
+        or normalized_channel_id is not None
+    ):
+        raise ValueError(
+            "`all_locations` cannot be combined with `guild_id` "
+            "or `channel_id`."
+        )
+
+    if not all_locations and (
+        normalized_guild_id is None
+        and normalized_channel_id is None
+    ):
+        normalized_guild_id = (
+            str(current_guild_id) if current_guild_id is not None else None
+        )
+        normalized_channel_id = (
+            str(current_channel_id)
+            if current_channel_id is not None
+            else None
+        )
+
+    created_from, created_before = parse_saved_message_date_range(
+        date_from=date_from,
+        date_to=date_to,
+    )
+    normalized_keyword = keyword.strip() if keyword else None
+
+    return SavedMessageFilters(
+        status=selected_status,
+        keyword=normalized_keyword or None,
+        created_from=created_from,
+        created_before=created_before,
+        author_id=normalized_author_id,
+        channel_id=normalized_channel_id,
+        guild_id=normalized_guild_id,
+    )
+
+
+def format_active_saved_filters(
+    *,
+    filters: SavedMessageFilters,
+    date_from: str | None,
+    date_to: str | None,
+) -> str:
+    parts = [f"Status: `{filters.status}`"]
+
+    if filters.keyword:
+        escaped_keyword = discord.utils.escape_markdown(filters.keyword)
+        escaped_keyword = escaped_keyword.replace("`", "\\`")
+        parts.append(f"Keyword: `{escaped_keyword}`")
+
+    if filters.author_id:
+        parts.append(f"Author: <@{filters.author_id}>")
+
+    if filters.channel_id:
+        parts.append(f"Channel: <#{filters.channel_id}>")
+
+    if filters.guild_id:
+        parts.append(f"Server ID: `{filters.guild_id}`")
+
+    if filters.channel_id is None and filters.guild_id is None:
+        parts.append("Location: all")
+
+    normalized_date_from = date_from.strip() if date_from else None
+    normalized_date_to = date_to.strip() if date_to else None
+
+    if normalized_date_from or normalized_date_to:
+        parts.append(
+            "Original date: "
+            f"`{normalized_date_from or 'any'}` to "
+            f"`{normalized_date_to or 'any'}`"
+        )
+
+    return "Active filters: " + " • ".join(parts)
+
+
+def _autocomplete_choice_name(label: str, discord_id: str) -> str:
+    suffix = f" ({discord_id})"
+    available_label_length = 100 - len(suffix)
+
+    if available_label_length < 1:
+        return discord_id[:100]
+
+    return f"{label[:available_label_length]}{suffix}"
+
+
 def prepare_attachments_to_save(
     attachments: list[discord.Attachment],
 ) -> tuple[AttachmentToSave, ...]:
@@ -96,6 +303,61 @@ def prepare_attachments_to_save(
             position=position,
         )
         for position, attachment in enumerate(attachments)
+    )
+
+
+def get_message_location_names(
+    message: discord.Message,
+) -> tuple[str | None, str | None]:
+    guild_name = (
+        str(message.guild.name)
+        if message.guild and getattr(message.guild, "name", None)
+        else None
+    )
+    channel_name_value = getattr(message.channel, "name", None)
+    channel_name = (
+        str(channel_name_value)
+        if channel_name_value
+        else None
+    )
+
+    return guild_name, channel_name
+
+
+def add_location_to_embed(
+    embed: discord.Embed,
+    *,
+    guild_id: str | None,
+    guild_name: str | None,
+    channel_id: str,
+    channel_name: str | None,
+) -> None:
+    if guild_id is None:
+        server_display = "Direct message"
+    elif guild_name:
+        server_display = discord.utils.escape_markdown(guild_name)
+    else:
+        server_display = f"ID: {guild_id}"
+
+    if channel_name:
+        escaped_channel_name = discord.utils.escape_markdown(channel_name)
+        channel_display = (
+            escaped_channel_name
+            if guild_id is None
+            else f"#{escaped_channel_name}"
+        )
+    else:
+        channel_display = f"ID: {channel_id}"
+
+    embed.add_field(
+        name="Server",
+        value=server_display,
+        inline=True,
+    )
+    embed.add_field(
+        name="Channel",
+        value=channel_display,
+        inline=True,
     )
 
 
@@ -239,21 +501,32 @@ async def get_messages_in_range(
 def prepare_messages_to_save(
     messages: list[discord.Message],
 ) -> list[MessageToSave]:
-    return [
-        MessageToSave(
-            message_id=str(message.id),
-            guild_id=str(message.guild.id) if message.guild else None,
-            channel_id=str(message.channel.id),
-            author_id=str(message.author.id),
-            author_name=str(message.author),
-            content=message.content,
-            jump_url=message.jump_url,
-            message_created_at=message.created_at.isoformat(),
-            position=position,
-            attachments=prepare_attachments_to_save(message.attachments),
+    messages_to_save = []
+
+    for position, message in enumerate(messages):
+        guild_name, channel_name = get_message_location_names(message)
+        messages_to_save.append(
+            MessageToSave(
+                message_id=str(message.id),
+                guild_id=(
+                    str(message.guild.id) if message.guild else None
+                ),
+                guild_name=guild_name,
+                channel_id=str(message.channel.id),
+                channel_name=channel_name,
+                author_id=str(message.author.id),
+                author_name=str(message.author),
+                content=message.content,
+                jump_url=message.jump_url,
+                message_created_at=message.created_at.isoformat(),
+                position=position,
+                attachments=prepare_attachments_to_save(
+                    message.attachments
+                ),
+            )
         )
-        for position, message in enumerate(messages)
-    ]
+
+    return messages_to_save
 
 
 async def complete_message_range(
@@ -500,12 +773,15 @@ async def save_as_unread(
         return
 
     guild_id = str(message.guild.id) if message.guild else None
+    guild_name, channel_name = get_message_location_names(message)
 
     was_inserted = await save_unread_message(
         saved_by_user_id=str(interaction.user.id),
         message_id=str(message.id),
         guild_id=guild_id,
+        guild_name=guild_name,
         channel_id=str(message.channel.id),
+        channel_name=channel_name,
         author_id=str(message.author.id),
         author_name=str(message.author),
         content=message.content,
@@ -903,6 +1179,14 @@ def create_saved_batch_summary_embed(
         value=str(message_count),
         inline=False,
     )
+    if message_count > 0:
+        add_location_to_embed(
+            embed,
+            guild_id=row["first_message_guild_id"],
+            guild_name=row["first_message_guild_name"],
+            channel_id=row["first_message_channel_id"],
+            channel_name=row["first_message_channel_name"],
+        )
     add_attachments_to_embed(
         embed,
         attachments,
@@ -955,6 +1239,13 @@ def create_saved_batch_message_embed(
         name="Created",
         value=row["message_created_at"],
         inline=False,
+    )
+    add_location_to_embed(
+        embed,
+        guild_id=row["guild_id"],
+        guild_name=row["guild_name"],
+        channel_id=row["channel_id"],
+        channel_name=row["channel_name"],
     )
     add_attachments_to_embed(
         embed,
@@ -1309,6 +1600,13 @@ async def show_saved_batches(
 @app_commands.describe(
     status="Choose which message status to show",
     page="Choose which page to show",
+    keyword="Find text in saved message content",
+    date_from="Original message date from YYYY-MM-DD",
+    date_to="Original message date through YYYY-MM-DD",
+    author_id="Message author (autocomplete or Discord ID)",
+    channel_id="Channel (autocomplete or Discord ID)",
+    guild_id="Server (autocomplete or Discord ID)",
+    all_locations="Search all locations instead of the current channel",
 )
 @app_commands.choices(
     status=[
@@ -1330,26 +1628,54 @@ async def show_saved_messages(
     interaction: discord.Interaction,
     status: app_commands.Choice[str] | None = None,
     page: app_commands.Range[int, 1] = 1,
+    keyword: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    author_id: str | None = None,
+    channel_id: str | None = None,
+    guild_id: str | None = None,
+    all_locations: bool = False,
 ) -> None:
-    
     print("/saved handler started")
     print("user:", interaction.user.id)
     print("status:", status)
 
     selected_status = status.value if status else "UNREAD"
-
     await interaction.response.defer(ephemeral=True)
+
+    try:
+        filters = create_saved_message_filters(
+            selected_status=selected_status,
+            keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
+            author_id=author_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            all_locations=all_locations,
+            current_guild_id=interaction.guild_id,
+            current_channel_id=interaction.channel_id,
+        )
+    except ValueError as error:
+        await interaction.edit_original_response(content=str(error))
+        return
+
+    active_filters = format_active_saved_filters(
+        filters=filters,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
     total_records = await count_saved_messages(
         saved_by_user_id=str(interaction.user.id),
-        status=selected_status,
+        filters=filters,
     )
 
     if total_records == 0:
         await interaction.edit_original_response(
             content=(
-                f"You have no saved messages "
-                f"with status `{selected_status}`."
+                "No saved messages match these filters.\n"
+                f"{active_filters}"
             ),
         )
         return
@@ -1362,15 +1688,15 @@ async def show_saved_messages(
         await interaction.edit_original_response(
             content=(
                 f"Page `{page}` does not exist. "
-                f"You have {total_pages} page(s) "
-                f"with status `{selected_status}`."
+                f"The filtered results have {total_pages} page(s).\n"
+                f"{active_filters}"
             ),
         )
         return
 
     rows = await get_saved_messages(
         saved_by_user_id=str(interaction.user.id),
-        status=selected_status,
+        filters=filters,
         limit=SAVED_MESSAGES_PAGE_SIZE,
         offset=(page - 1) * SAVED_MESSAGES_PAGE_SIZE,
     )
@@ -1405,6 +1731,13 @@ async def show_saved_messages(
             value=row["message_created_at"],
             inline=False,
         )
+        add_location_to_embed(
+            embed,
+            guild_id=row["guild_id"],
+            guild_name=row["guild_name"],
+            channel_id=row["channel_id"],
+            channel_name=row["channel_name"],
+        )
         add_attachments_to_embed(
             embed,
             attachments,
@@ -1429,6 +1762,10 @@ async def show_saved_messages(
 
         if index == 0:
             await interaction.edit_original_response(
+                content=(
+                    f"Saved messages — page {page}/{total_pages}\n"
+                    f"{active_filters}"
+                ),
                 embed=embed,
                 view=view,
             )
@@ -1438,7 +1775,102 @@ async def show_saved_messages(
                 view=view,
                 ephemeral=True,
             )
-    
+
+
+@show_saved_messages.autocomplete("author_id")
+async def saved_author_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    rows = await get_saved_author_autocomplete_choices(
+        saved_by_user_id=str(interaction.user.id),
+        current=current,
+    )
+
+    return [
+        app_commands.Choice(
+            name=_autocomplete_choice_name(
+                row["author_name"],
+                row["author_id"],
+            ),
+            value=row["author_id"],
+        )
+        for row in rows
+    ]
+
+
+@show_saved_messages.autocomplete("channel_id")
+async def saved_channel_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    selected_guild_id = getattr(interaction.namespace, "guild_id", None)
+
+    if selected_guild_id is not None:
+        selected_guild_id = str(selected_guild_id).strip()
+
+        if not selected_guild_id.isdecimal():
+            selected_guild_id = None
+
+    if selected_guild_id is None and not getattr(
+        interaction.namespace,
+        "all_locations",
+        False,
+    ):
+        selected_guild_id = (
+            str(interaction.guild_id)
+            if interaction.guild_id is not None
+            else None
+        )
+
+    rows = await get_saved_channel_autocomplete_choices(
+        saved_by_user_id=str(interaction.user.id),
+        current=current,
+        guild_id=selected_guild_id,
+    )
+    choices = []
+
+    for row in rows:
+        channel_label = (
+            f"#{row['channel_name']}"
+            if row["channel_name"]
+            else "Unknown channel"
+        )
+        location_label = row["guild_name"] or "Direct message"
+        choices.append(
+            app_commands.Choice(
+                name=_autocomplete_choice_name(
+                    f"{channel_label} — {location_label}",
+                    row["channel_id"],
+                ),
+                value=row["channel_id"],
+            )
+        )
+
+    return choices
+
+
+@show_saved_messages.autocomplete("guild_id")
+async def saved_guild_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    rows = await get_saved_guild_autocomplete_choices(
+        saved_by_user_id=str(interaction.user.id),
+        current=current,
+    )
+
+    return [
+        app_commands.Choice(
+            name=_autocomplete_choice_name(
+                row["guild_name"] or "Unknown server",
+                row["guild_id"],
+            ),
+            value=row["guild_id"],
+        )
+        for row in rows
+    ]
+
 
 token = os.getenv("DISCORD_TOKEN")
 

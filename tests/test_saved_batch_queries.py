@@ -29,7 +29,9 @@ class SavedBatchQueryTests(unittest.IsolatedAsyncioTestCase):
             saved_by_user_id=saved_by_user_id,
             message_id=message_id,
             guild_id="guild-1",
+            guild_name="Guild One",
             channel_id="channel-1",
+            channel_name="general",
             author_id=f"author-{message_id}",
             author_name=f"Author {message_id}",
             content=f"Content for {message_id}",
@@ -40,7 +42,7 @@ class SavedBatchQueryTests(unittest.IsolatedAsyncioTestCase):
 
         rows = await database.get_saved_messages(
             saved_by_user_id=saved_by_user_id,
-            status="ALL",
+            filters=database.SavedMessageFilters(status="ALL"),
             limit=1,
         )
 
@@ -150,6 +152,10 @@ class SavedBatchQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summary["created_at"])
         self.assertEqual(summary["message_count"], 0)
         self.assertIsNone(summary["first_message_record_id"])
+        self.assertIsNone(summary["first_message_guild_id"])
+        self.assertIsNone(summary["first_message_guild_name"])
+        self.assertIsNone(summary["first_message_channel_id"])
+        self.assertIsNone(summary["first_message_channel_name"])
         self.assertIsNone(summary["first_message_author_name"])
         self.assertIsNone(summary["first_message_content"])
         self.assertIsNone(summary["first_message_jump_url"])
@@ -201,6 +207,22 @@ class SavedBatchQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             summary_before_delete["first_message_record_id"],
             second_message_id,
+        )
+        self.assertEqual(
+            summary_before_delete["first_message_guild_id"],
+            "guild-1",
+        )
+        self.assertEqual(
+            summary_before_delete["first_message_guild_name"],
+            "Guild One",
+        )
+        self.assertEqual(
+            summary_before_delete["first_message_channel_id"],
+            "channel-1",
+        )
+        self.assertEqual(
+            summary_before_delete["first_message_channel_name"],
+            "general",
         )
         self.assertEqual(
             summary_before_delete["first_message_author_name"],
@@ -317,6 +339,10 @@ class SavedBatchQueryTests(unittest.IsolatedAsyncioTestCase):
             [0, 10],
         )
         self.assertEqual(first_page[1]["status"], "READ_KEEP")
+        self.assertEqual(first_page[0]["guild_id"], "guild-1")
+        self.assertEqual(first_page[0]["guild_name"], "Guild One")
+        self.assertEqual(first_page[0]["channel_id"], "channel-1")
+        self.assertEqual(first_page[0]["channel_name"], "general")
         self.assertEqual(first_page[0]["author_name"], "Author message-1")
         self.assertEqual(first_page[0]["content"], "Content for message-1")
         self.assertEqual(

@@ -48,8 +48,13 @@ class FakeAttachment:
 
 
 class FakeChannel:
-    def __init__(self, channel_id: int) -> None:
+    def __init__(
+        self,
+        channel_id: int,
+        name: str = "general",
+    ) -> None:
         self.id = channel_id
+        self.name = name
         self.history_messages = []
         self.history_arguments = None
         self.fetched_message = None
@@ -84,7 +89,7 @@ class FakeMessage:
         attachments: list[FakeAttachment] | None = None,
     ) -> None:
         self.id = message_id
-        self.guild = SimpleNamespace(id=10)
+        self.guild = SimpleNamespace(id=10, name="Test Guild")
         self.channel = channel
         self.author = FakeAuthor(author_id, f"Author {author_id}")
         self.content = content or f"Message {message_id}"
@@ -410,6 +415,14 @@ class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.position for message in prepared_messages],
             [0, 1],
+        )
+        self.assertEqual(
+            [message.guild_name for message in prepared_messages],
+            ["Test Guild", "Test Guild"],
+        )
+        self.assertEqual(
+            [message.channel_name for message in prepared_messages],
+            ["general", "general"],
         )
         self.assertEqual(
             prepared_messages[0].attachments,

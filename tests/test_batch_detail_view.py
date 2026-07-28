@@ -43,6 +43,10 @@ def saved_message_row(
 ) -> dict[str, object]:
     return {
         "id": record_id,
+        "guild_id": "10",
+        "guild_name": "Test Guild",
+        "channel_id": "20",
+        "channel_name": "general",
         "author_name": f"Author {record_id}",
         "content": content,
         "jump_url": f"https://discord.test/messages/{record_id}",
@@ -231,8 +235,12 @@ class BatchDetailPageTests(unittest.IsolatedAsyncioTestCase):
             first_embed.description,
         )
         self.assertIn("Open message", first_embed.description)
-        self.assertEqual(first_embed.fields[1].name, "Attachments (1)")
-        self.assertIn("diagram.png", first_embed.fields[1].value)
+        self.assertEqual(first_embed.fields[1].name, "Server")
+        self.assertEqual(first_embed.fields[1].value, "Test Guild")
+        self.assertEqual(first_embed.fields[2].name, "Channel")
+        self.assertEqual(first_embed.fields[2].value, "#general")
+        self.assertEqual(first_embed.fields[3].name, "Attachments (1)")
+        self.assertIn("diagram.png", first_embed.fields[3].value)
         self.assertEqual(
             first_embed.image.url,
             "https://proxy.discord.test/image-1",
@@ -245,7 +253,7 @@ class BatchDetailPageTests(unittest.IsolatedAsyncioTestCase):
             "x" * (bot.BATCH_DETAIL_CONTENT_LIMIT - 3) + "...",
             second_embed.description,
         )
-        self.assertIn("notes.pdf", second_embed.fields[1].value)
+        self.assertIn("notes.pdf", second_embed.fields[3].value)
         self.assertIsNone(second_embed.image.url)
         self.assertEqual(
             second_embed.footer.text,
@@ -370,7 +378,7 @@ class BatchDetailPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(sum(len(embed) for embed in page.embeds), 6000)
         self.assertTrue(
             all(
-                len(embed.fields[1].value)
+                len(embed.fields[3].value)
                 <= bot.BATCH_ATTACHMENT_FIELD_VALUE_LIMIT
                 for embed in page.embeds
             )

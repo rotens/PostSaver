@@ -53,17 +53,19 @@ class FakeMessage:
         message_id: int = 100,
         author: FakeAuthor | None = None,
         guild_id: int | None = 10,
+        guild_name: str = "Test Guild",
         channel_id: int = 20,
+        channel_name: str = "general",
         attachments: list[FakeAttachment] | None = None,
     ) -> None:
         self.id = message_id
         self.author = author or FakeAuthor(30)
         self.guild = (
-            SimpleNamespace(id=guild_id)
+            SimpleNamespace(id=guild_id, name=guild_name)
             if guild_id is not None
             else None
         )
-        self.channel = SimpleNamespace(id=channel_id)
+        self.channel = SimpleNamespace(id=channel_id, name=channel_name)
         self.content = "Message content"
         self.jump_url = f"https://discord.test/{message_id}"
         self.created_at = datetime(2026, 7, 23, tzinfo=timezone.utc)
@@ -77,6 +79,18 @@ class FakeInteraction:
             send_message=AsyncMock(),
             send_modal=AsyncMock(),
         )
+
+
+class CommandTreeConfigurationTests(unittest.TestCase):
+    def test_commands_support_server_user_and_private_contexts(self) -> None:
+        installs = bot.bot.tree.allowed_installs
+        contexts = bot.bot.tree.allowed_contexts
+
+        self.assertTrue(installs.guild)
+        self.assertTrue(installs.user)
+        self.assertTrue(contexts.guild)
+        self.assertTrue(contexts.dm_channel)
+        self.assertTrue(contexts.private_channel)
 
 
 class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -156,7 +170,9 @@ class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
             saved_by_user_id="42",
             message_id="100",
             guild_id="10",
+            guild_name="Test Guild",
             channel_id="20",
+            channel_name="general",
             author_id="30",
             author_name="Author",
             content="Message content",
@@ -215,6 +231,11 @@ class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
             await bot.save_as_unread.callback(interaction, message)
 
         self.assertIsNone(save_message.await_args.kwargs["guild_id"])
+        self.assertIsNone(save_message.await_args.kwargs["guild_name"])
+        self.assertEqual(
+            save_message.await_args.kwargs["channel_name"],
+            "general",
+        )
         interaction.response.send_message.assert_awaited_once_with(
             "This message is already saved.",
             ephemeral=True,

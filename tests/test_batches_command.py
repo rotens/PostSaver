@@ -35,6 +35,10 @@ def batch_summary(
         "created_at": "2026-07-24 12:00:00",
         "message_count": message_count,
         "first_message_record_id": batch_id * 10 if has_messages else None,
+        "first_message_guild_id": "10" if has_messages else None,
+        "first_message_guild_name": "Test Guild" if has_messages else None,
+        "first_message_channel_id": "20" if has_messages else None,
+        "first_message_channel_name": "general" if has_messages else None,
         "first_message_author_name": (
             f"Author {batch_id}" if has_messages else None
         ),
@@ -257,9 +261,13 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embeds[0].fields[0].value, "2026-07-24 12:00:00")
         self.assertEqual(embeds[0].fields[1].name, "Messages")
         self.assertEqual(embeds[0].fields[1].value, "12")
-        self.assertEqual(embeds[0].fields[2].name, "Attachments (2)")
-        self.assertIn("architecture.png", embeds[0].fields[2].value)
-        self.assertIn("architecture.pdf", embeds[0].fields[2].value)
+        self.assertEqual(embeds[0].fields[2].name, "Server")
+        self.assertEqual(embeds[0].fields[2].value, "Test Guild")
+        self.assertEqual(embeds[0].fields[3].name, "Channel")
+        self.assertEqual(embeds[0].fields[3].value, "#general")
+        self.assertEqual(embeds[0].fields[4].name, "Attachments (2)")
+        self.assertIn("architecture.png", embeds[0].fields[4].value)
+        self.assertIn("architecture.pdf", embeds[0].fields[4].value)
         self.assertEqual(
             embeds[0].image.url,
             "https://proxy.discord.test/image-1",
@@ -274,8 +282,8 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             embeds[1].description,
         )
-        self.assertEqual(embeds[1].fields[2].name, "Attachments (1)")
-        self.assertIn("notes.txt", embeds[1].fields[2].value)
+        self.assertEqual(embeds[1].fields[4].name, "Attachments (1)")
+        self.assertIn("notes.txt", embeds[1].fields[4].value)
         self.assertIsNone(embeds[1].image.url)
         self.assertEqual(embeds[2].title, "Empty batch")
         self.assertEqual(
@@ -341,7 +349,7 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(embed) <= 6000 for embed in embeds))
         self.assertTrue(
             all(
-                len(embed.fields[2].value)
+                len(embed.fields[4].value)
                 <= bot.BATCH_ATTACHMENT_FIELD_VALUE_LIMIT
                 for embed in embeds
             )

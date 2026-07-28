@@ -18,7 +18,14 @@ The bot uses:
 
 - `Apps → Save as UNREAD` saves a selected Discord message.
 - `/saved` displays saved records using five records per page.
-- `/saved` supports `UNREAD`, `READ_KEEP`, and `ALL` filters.
+- `/saved` supports status, literal keyword, original-message date, author,
+  channel, and server filters.
+- If neither a channel nor a server is supplied, `/saved` uses the channel and
+  server where the command was invoked. Set `all_locations:true` to search all
+  saved locations instead.
+- Author, channel, and server inputs offer autocomplete choices drawn only
+  from the invoking user's saved records. A Discord ID can also be entered
+  directly.
 - Every saved-message panel provides:
   - `READ_KEEP`
   - `UNREAD`
@@ -29,6 +36,8 @@ The bot uses:
 - Records and button actions are scoped to the user who saved them.
 - Saved-message panels list stored attachments as filename links with readable
   file sizes and preview the first image attachment.
+- Saved-message panels show the stored server and channel names. Older records
+  without names fall back to their Discord IDs.
 - Attachment-only messages display a dedicated no-text explanation instead of
   appearing empty.
 
@@ -96,13 +105,15 @@ newest first. Every summary has its own `View batch` button and contains:
 - the batch creation time;
 - the current number of messages;
 - a preview and direct link for the first remaining message;
+- the server and channel of the previewed message;
 - attachment links and the first image preview from that first message.
 
 `View batch` opens a separate ephemeral detail response with five messages per
 page. Detail pages preserve the batch order and show each message's author,
 text, creation time, current status, attachments, image preview, position in
-the batch, and original-message link. `Previous` and `Next` edit the detail
-response in place, and the unavailable boundary action is disabled.
+the batch, server, channel, and original-message link. `Previous` and `Next`
+edit the detail response in place, and the unavailable boundary action is
+disabled.
 
 Empty batches remain visible, but their `View batch` button is disabled. Batch
 summaries and details are currently read-only: they do not provide rename,
@@ -169,13 +180,21 @@ Do not commit `.env`. It is excluded by `.gitignore`.
 In the Discord Developer Portal:
 
 1. Open the application.
-2. Open its **Bot** settings.
-3. Enable **Message Content Intent** under **Privileged Gateway Intents**.
-4. Save the change.
+2. Open **Installation** and enable both **Guild Install** and **User
+   Install** if commands should be available in servers, bot DMs, other DMs,
+   and group DMs.
+3. Configure the user installation with the `applications.commands` scope and
+   install the application for your Discord user.
+4. Open its **Bot** settings.
+5. Enable **Message Content Intent** under **Privileged Gateway Intents**.
+6. Save the change.
 
 The intent is also enabled in `ReadingBot` in `bot.py`. Both configuration
 steps are necessary for retrieving the content of messages returned by channel
-history.
+history. The command tree explicitly supports guild installation, user
+installation, server channels, direct conversations with the bot, and private
+DM/group-DM command surfaces. Restart the bot after changing installation
+settings so its startup `tree.sync()` updates the registered commands.
 
 ## Running the bot
 
@@ -238,7 +257,7 @@ place and only replace or clear its data.
 
 | Command | Purpose |
 |---|---|
-| `/saved` | Display the user's saved messages with status and page options. |
+| `/saved` | Display the user's saved messages with pagination and optional status, keyword, original-date, author, channel, and server filters. |
 | `/batches` | Display paginated batch summaries with read-only message details. |
 | `/ignore_user` | Ignore messages written by a selected user. |
 | `/unignore_user` | Remove one user from the ignore list. |
@@ -273,7 +292,7 @@ All command responses and saved-message panels are currently ephemeral.
 
 | Table | Purpose |
 |---|---|
-| `saved_messages` | Per-user saved Discord message records and statuses. |
+| `saved_messages` | Per-user saved Discord messages, statuses, and location-name snapshots. |
 | `saved_message_attachments` | Ordered attachment metadata belonging to saved messages. |
 | `ignored_users` | Per-user ignored-author settings. |
 | `pending_ranges` | One persistent pending range start per user. |
@@ -285,6 +304,24 @@ Discord IDs are stored as text. Duplicate saved records are prevented by:
 ```sql
 UNIQUE(saved_by_user_id, message_id)
 ```
+
+New saved records store nullable `guild_name` and `channel_name` snapshots in
+addition to their stable Discord IDs. On startup, existing databases are
+upgraded additively if either column is missing. Existing records are
+preserved; their new name columns remain `NULL` and displays fall back to IDs.
+
+The saved-message count and listing queries share one `SavedMessageFilters`
+value. The database layer supports status, literal case-insensitive content
+keywords, original-message date boundaries, author ID, channel ID, and server
+ID. `created_from` is inclusive and `created_before` is exclusive. `/saved`
+accepts dates as `YYYY-MM-DD`; its user-facing end date includes that entire
+UTC calendar day and is converted to the exclusive start of the next day for
+the database query.
+
+Autocomplete queries are scoped to the user who invokes `/saved`, return at
+most 25 choices, and match stored names or Discord IDs. When a server is
+selected, channel autocomplete is limited to that server. Without an explicit
+server, it defaults to the current server unless `all_locations:true` is set.
 
 Deleting a saved message removes its attachment metadata and batch
 associations through foreign-key cascading. It does not automatically delete
@@ -301,7 +338,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 108 tests covering:
+The current suite contains 130 tests covering:
 
 - individual-message storage, duplicate handling, ordering, and pagination;
 - attachment schema, metadata conversion, ordering, validation, ownership,
@@ -310,8 +347,16 @@ The current suite contains 108 tests covering:
 - saved-message status validation, ownership, and deletion;
 - ignored-user creation, removal, reset, self-ignore, and owner isolation;
 - Discord command responses and metadata passed to the database layer;
+- additive location-column migration, single-message and range location
+  capture, query propagation, readable location rendering, and old-record
+  fallbacks;
 - saved-message view ownership, button states, status changes, and deletion;
-- `/saved` filtering, page calculation, empty results, and panel rendering;
+- `/saved` filter parsing and validation, current-location defaults, active
+  filter summaries, page calculation, empty results, and panel rendering;
+- author, channel, and server autocomplete ownership, matching, location
+  scoping, and Discord choice rendering;
+- individual and combined saved-message query filters, literal keyword
+  escaping, original-message date boundaries, and count/list consistency;
 - pending-range creation, replacement, isolation, and deletion;
 - batch creation, ownership, ordering, associations, summaries, and
   paginated contents;
@@ -350,7 +395,8 @@ data/reading_manager.db
 ## Current limitations
 
 - Saved batches cannot yet be renamed or deleted through Discord.
-- `/saved` cannot yet filter by author, channel, server, date, or keywords.
+- Saved-batch summaries cannot yet be filtered by author, channel, server,
+  date, or keywords.
 - Attachment files are not downloaded or archived; views depend on stored
   Discord URLs remaining available.
 - Batch-level status changes are not implemented.
