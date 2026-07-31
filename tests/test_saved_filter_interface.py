@@ -51,11 +51,16 @@ class SavedFilterParsingTests(unittest.TestCase):
                 "channel_id",
                 "guild_id",
                 "all_locations",
+                "sort",
             ],
         )
         self.assertTrue(parameters["author_id"].autocomplete)
         self.assertTrue(parameters["channel_id"].autocomplete)
         self.assertTrue(parameters["guild_id"].autocomplete)
+        self.assertEqual(
+            [choice.value for choice in parameters["sort"].choices],
+            [sort.value for sort in bot.SavedItemSort],
+        )
 
     def test_dates_are_converted_to_inclusive_utc_day_boundaries(self) -> None:
         created_from, created_before = bot.parse_saved_message_date_range(
@@ -214,6 +219,7 @@ class SavedFilteredCommandTests(unittest.IsolatedAsyncioTestCase):
                 author_id="30",
                 channel_id="20",
                 guild_id="10",
+                sort=SimpleNamespace(value="LENGTH_ASC"),
             )
 
         expected_filters = bot.SavedMessageFilters(
@@ -230,12 +236,17 @@ class SavedFilteredCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(count_filters, expected_filters)
         self.assertIs(count_filters, list_filters)
+        self.assertEqual(
+            get_messages.await_args.kwargs["sort"],
+            bot.SavedItemSort.LENGTH_ASC,
+        )
         content = interaction.edit_original_response.await_args.kwargs[
             "content"
         ]
         self.assertIn("Keyword: `needle`", content)
         self.assertIn("Author: <@30>", content)
         self.assertIn("Original date: `2026-07-01` to `2026-07-03`", content)
+        self.assertIn("Sort: `Length ascending`", content)
 
     async def test_invalid_date_returns_before_database_queries(self) -> None:
         interaction = FakeInteraction()
@@ -288,7 +299,7 @@ class SavedAutocompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(choices[0].name, "Alice (30)")
         self.assertEqual(choices[0].value, "30")
 
-    async def test_channel_autocomplete_defaults_to_current_server(self) -> None:
+    async def test_channel_autocomplete_searches_all_saved_locations(self) -> None:
         interaction = FakeInteraction()
         rows = [
             {
@@ -309,7 +320,7 @@ class SavedAutocompleteTests(unittest.IsolatedAsyncioTestCase):
         query.assert_awaited_once_with(
             saved_by_user_id="42",
             current="gen",
-            guild_id="10",
+            guild_id=None,
         )
         self.assertEqual(
             choices[0].name,

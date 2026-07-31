@@ -85,12 +85,16 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
         self,
         *,
         message_count: int = 3,
+        filters: bot.SavedMessageFilters | None = None,
+        sort: bot.SavedItemSort = bot.SavedItemSort.DEFAULT,
     ) -> bot.BatchSummaryView:
         return bot.BatchSummaryView(
             batch_id=17,
             owner_user_id=42,
             title="Architecture",
             message_count=message_count,
+            filters=filters,
+            sort=sort,
         )
 
     def test_view_button_targets_batch_and_empty_batch_disables_it(
@@ -117,7 +121,14 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_view_button_opens_its_own_batch(self) -> None:
-        view = self.create_view()
+        filters = bot.SavedMessageFilters(
+            status="ALL",
+            keyword="python",
+        )
+        view = self.create_view(
+            filters=filters,
+            sort=bot.SavedItemSort.LENGTH_DESC,
+        )
         interaction = FakeInteraction()
 
         with patch.object(
@@ -131,10 +142,51 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
             interaction,
             batch_id=17,
             title="Architecture",
+            filters=filters,
+            sort=bot.SavedItemSort.LENGTH_DESC,
         )
 
 
 class BatchDetailPageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_filtered_page_passes_same_filters_to_count_and_list(
+        self,
+    ) -> None:
+        filters = bot.SavedMessageFilters(
+            status="READ_KEEP",
+            keyword="python",
+        )
+        rows = [saved_message_row(record_id=7, status="READ_KEEP")]
+
+        with (
+            patch.object(
+                bot,
+                "count_saved_messages_in_batch",
+                new=AsyncMock(return_value=1),
+            ) as count_messages,
+            patch.object(
+                bot,
+                "get_saved_messages_in_batch",
+                new=AsyncMock(return_value=rows),
+            ) as get_messages,
+            patch.object(
+                bot,
+                "get_attachments_for_saved_messages",
+                new=AsyncMock(return_value={7: []}),
+            ),
+        ):
+            page = await bot.get_saved_batch_detail_page(
+                batch_id=17,
+                saved_by_user_id="42",
+                requested_page=1,
+                filters=filters,
+            )
+
+        self.assertIsNotNone(page)
+        count_filters = count_messages.await_args.kwargs["filters"]
+        list_filters = get_messages.await_args.kwargs["filters"]
+        self.assertIs(count_filters, filters)
+        self.assertIs(list_filters, filters)
+
     async def test_page_below_one_is_rejected_before_database_query(
         self,
     ) -> None:
@@ -213,10 +265,12 @@ class BatchDetailPageTests(unittest.IsolatedAsyncioTestCase):
         count_messages.assert_awaited_once_with(
             batch_id=17,
             saved_by_user_id="42",
+            filters=None,
         )
         get_messages.assert_awaited_once_with(
             batch_id=17,
             saved_by_user_id="42",
+            filters=None,
             limit=5,
             offset=5,
         )
@@ -322,6 +376,7 @@ class BatchDetailPageTests(unittest.IsolatedAsyncioTestCase):
         get_messages.assert_awaited_once_with(
             batch_id=17,
             saved_by_user_id="42",
+            filters=None,
             limit=5,
             offset=10,
         )
@@ -391,6 +446,8 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
         *,
         current_page: int = 1,
         total_pages: int = 3,
+        filters: bot.SavedMessageFilters | None = None,
+        sort: bot.SavedItemSort = bot.SavedItemSort.DEFAULT,
     ) -> bot.BatchDetailView:
         return bot.BatchDetailView(
             batch_id=17,
@@ -398,6 +455,8 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
             title="Design *notes*",
             current_page=current_page,
             total_pages=total_pages,
+            filters=filters,
+            sort=sort,
         )
 
     def test_boundary_buttons_match_current_page(self) -> None:
@@ -427,7 +486,15 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_next_button_loads_and_edits_the_next_page(self) -> None:
-        view = self.create_view(current_page=1)
+        filters = bot.SavedMessageFilters(
+            status="ALL",
+            author_id="30",
+        )
+        view = self.create_view(
+            current_page=1,
+            filters=filters,
+            sort=bot.SavedItemSort.LENGTH_ASC,
+        )
         interaction = FakeInteraction()
         page = bot.SavedBatchDetailPage(
             current_page=2,
@@ -450,8 +517,10 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
             batch_id=17,
             saved_by_user_id="42",
             requested_page=2,
+            filters=filters,
         )
         self.assertEqual(view.current_page, 2)
+        self.assertEqual(view.sort, bot.SavedItemSort.LENGTH_ASC)
         self.assertFalse(view.previous_page.disabled)
         self.assertFalse(view.next_page.disabled)
         interaction.response.defer.assert_awaited_once_with()
@@ -482,6 +551,30 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
             view=None,
         )
 
+    async def test_filtered_empty_page_reports_no_matching_messages(
+        self,
+    ) -> None:
+        view = self.create_view(
+            filters=bot.SavedMessageFilters(
+                status="ALL",
+                keyword="missing",
+            )
+        )
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "get_saved_batch_detail_page",
+            new=AsyncMock(return_value=None),
+        ):
+            await view.show_page(interaction, 2)
+
+        interaction.edit_original_response.assert_awaited_once_with(
+            content="No messages in this batch match the active filters.",
+            embeds=[],
+            view=None,
+        )
+
     async def test_open_detail_creates_separate_ephemeral_response(
         self,
     ) -> None:
@@ -502,6 +595,7 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
                 interaction,
                 batch_id=17,
                 title="Architecture",
+                sort=bot.SavedItemSort.DATE_ASC,
             )
 
         interaction.response.defer.assert_awaited_once_with(
@@ -512,6 +606,7 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
             batch_id=17,
             saved_by_user_id="42",
             requested_page=1,
+            filters=None,
         )
         edit_call = interaction.edit_original_response.await_args
         self.assertEqual(
@@ -523,6 +618,7 @@ class BatchDetailViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(detail_view, bot.BatchDetailView)
         self.assertEqual(detail_view.batch_id, 17)
         self.assertEqual(detail_view.owner_user_id, 42)
+        self.assertEqual(detail_view.sort, bot.SavedItemSort.DATE_ASC)
 
     async def test_open_detail_reports_batch_that_became_empty(self) -> None:
         interaction = FakeInteraction()

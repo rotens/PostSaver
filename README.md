@@ -20,6 +20,8 @@ The bot uses:
 - `/saved` displays saved records using five records per page.
 - `/saved` supports status, literal keyword, original-message date, author,
   channel, and server filters.
+- `/saved` can sort by original-message date or text length in either
+  direction. Its default order remains newest save first.
 - If neither a channel nor a server is supplied, `/saved` uses the channel and
   server where the command was invoked. Set `all_locations:true` to search all
   saved locations instead.
@@ -104,7 +106,9 @@ newest first. Every summary has its own `View batch` button and contains:
 - the batch title, or an `Untitled batch #<id>` fallback;
 - the batch creation time;
 - the current number of messages;
-- a preview and direct link for the first remaining message;
+- a preview and direct link for the first remaining or matching message;
+- a direct link to the last remaining or matching message when it differs
+  from the first;
 - the server and channel of the previewed message;
 - attachment links and the first image preview from that first message.
 
@@ -114,6 +118,21 @@ text, creation time, current status, attachments, image preview, position in
 the batch, server, channel, and original-message link. `Previous` and `Next`
 edit the detail response in place, and the unavailable boundary action is
 disabled.
+
+`/batches` supports the same status, original-message date, author, channel,
+and server filters as `/saved`. Keywords match either batch titles or saved
+message content. Filtered summaries display matching messages alongside the
+batch's total message count, preview the first matching message, and preserve
+the filters when `View batch`, `Previous`, or `Next` is used. With no explicit
+location, the current channel and server are used. Use `all_locations:true`
+with status `ALL` and no other filters for the unfiltered view, which includes
+empty batches.
+
+`/batches` can sort by batch creation date or summed message text length in
+either direction. Filtered length sorting sums only matching messages;
+unfiltered length sorting sums every message. Batch detail pages retain the
+selected sort state but continue to display messages in their canonical batch
+position order.
 
 Empty batches remain visible, but their `View batch` button is disabled. Batch
 summaries and details are currently read-only: they do not provide rename,
@@ -258,7 +277,7 @@ place and only replace or clear its data.
 | Command | Purpose |
 |---|---|
 | `/saved` | Display the user's saved messages with pagination and optional status, keyword, original-date, author, channel, and server filters. |
-| `/batches` | Display paginated batch summaries with read-only message details. |
+| `/batches` | Display and filter paginated batch summaries with read-only message details. |
 | `/ignore_user` | Ignore messages written by a selected user. |
 | `/unignore_user` | Remove one user from the ignore list. |
 | `/unignore_all` | Reset the user's ignore list. |
@@ -318,10 +337,27 @@ accepts dates as `YYYY-MM-DD`; its user-facing end date includes that entire
 UTC calendar day and is converted to the exclusive start of the next day for
 the database query.
 
-Autocomplete queries are scoped to the user who invokes `/saved`, return at
-most 25 choices, and match stored names or Discord IDs. When a server is
-selected, channel autocomplete is limited to that server. Without an explicit
-server, it defaults to the current server unless `all_locations:true` is set.
+Autocomplete queries shared by `/saved` and `/batches` are scoped to the user
+who invokes the command, return at most 25 choices, and match stored names or
+Discord IDs. When a server is explicitly selected, channel autocomplete is
+limited to that server. Without an explicit server, channel autocomplete
+searches every saved server and DM so a private channel can be selected while
+the command is invoked from a server.
+
+Batch summary queries return total and matching message counts and select the
+lowest- and highest-position matching messages for the first and last links.
+They also return total and matching text-length aggregates. Filtered
+batch-detail count and listing queries use the same `SavedMessageFilters`
+value. Keyword matching checks both the batch title and message content; all
+other filters still apply to individual messages. All summary and detail
+queries remain owner-scoped.
+
+`SavedItemSort` validates the shared `DEFAULT`, `DATE_DESC`, `DATE_ASC`,
+`LENGTH_DESC`, and `LENGTH_ASC` modes before a fixed SQL ordering is selected.
+Every ordering includes the record ID as a deterministic tie-breaker so page
+boundaries remain stable when dates or lengths are equal. Text length is the
+number of characters in `content`; attachment-only messages therefore have
+length zero.
 
 Deleting a saved message removes its attachment metadata and batch
 associations through foreign-key cascading. It does not automatically delete
@@ -338,9 +374,10 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 130 tests covering:
+The current suite contains 145 tests covering:
 
-- individual-message storage, duplicate handling, ordering, and pagination;
+- individual-message storage, duplicate handling, deterministic date/length
+  sorting, ordering, and pagination;
 - attachment schema, metadata conversion, ordering, validation, ownership,
   single-message and range capture, transaction rollback, cascade deletion,
   command rendering, image previews, and display truncation;
@@ -358,10 +395,13 @@ The current suite contains 130 tests covering:
 - individual and combined saved-message query filters, literal keyword
   escaping, original-message date boundaries, and count/list consistency;
 - pending-range creation, replacement, isolation, and deletion;
-- batch creation, ownership, ordering, associations, summaries, and
-  paginated contents;
-- `/batches` empty states, page validation, per-summary views, detail opening,
-  detail pagination, ownership, attachment rendering, and embed limits;
+- batch creation, ownership, ordering, associations, filtered total/matching
+  counts and text lengths, first/last matching links, title searches,
+  deterministic date/length sorting, and paginated contents;
+- `/batches` filter parsing and autocomplete reuse, active-filter summaries,
+  empty states, page validation, per-summary views, filtered detail opening,
+  filter-preserving navigation, ownership, attachment rendering, and embed
+  limits;
 - inclusive and reverse-direction history retrieval;
 - the 1,000-message scan limit and 300-message saved-message limit;
 - ignored-author filtering;
@@ -395,8 +435,6 @@ data/reading_manager.db
 ## Current limitations
 
 - Saved batches cannot yet be renamed or deleted through Discord.
-- Saved-batch summaries cannot yet be filtered by author, channel, server,
-  date, or keywords.
 - Attachment files are not downloaded or archived; views depend on stored
   Discord URLs remaining available.
 - Batch-level status changes are not implemented.

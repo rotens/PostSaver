@@ -234,6 +234,7 @@ class SavedCommandTests(unittest.IsolatedAsyncioTestCase):
                 channel_id="20",
                 guild_id="10",
             ),
+            sort=bot.SavedItemSort.DEFAULT,
             limit=5,
             offset=5,
         )

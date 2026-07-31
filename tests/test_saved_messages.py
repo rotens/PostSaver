@@ -464,6 +464,86 @@ class SavedMessageDatabaseTests(unittest.IsolatedAsyncioTestCase):
             ["Python SQLite target"],
         )
 
+    async def test_saved_message_date_and_length_sorting_is_deterministic(
+        self,
+    ) -> None:
+        _, first_id = await self.save_message(
+            message_id="first",
+            content="xxxx",
+            message_created_at="2026-07-02T00:00:00+00:00",
+        )
+        _, second_id = await self.save_message(
+            message_id="second",
+            content="y",
+            message_created_at="2026-07-01T00:00:00+00:00",
+        )
+        _, third_id = await self.save_message(
+            message_id="third",
+            content="zzzz",
+            message_created_at="2026-07-02T00:00:00+00:00",
+        )
+        filters = database.SavedMessageFilters(status="ALL")
+
+        date_desc = await database.get_saved_messages(
+            saved_by_user_id="user-1",
+            filters=filters,
+            sort=database.SavedItemSort.DATE_DESC,
+        )
+        date_asc = await database.get_saved_messages(
+            saved_by_user_id="user-1",
+            filters=filters,
+            sort=database.SavedItemSort.DATE_ASC,
+        )
+        length_desc_page_one = await database.get_saved_messages(
+            saved_by_user_id="user-1",
+            filters=filters,
+            sort=database.SavedItemSort.LENGTH_DESC,
+            limit=2,
+            offset=0,
+        )
+        length_desc_page_two = await database.get_saved_messages(
+            saved_by_user_id="user-1",
+            filters=filters,
+            sort=database.SavedItemSort.LENGTH_DESC,
+            limit=2,
+            offset=2,
+        )
+        length_asc = await database.get_saved_messages(
+            saved_by_user_id="user-1",
+            filters=filters,
+            sort=database.SavedItemSort.LENGTH_ASC,
+        )
+
+        self.assertEqual(
+            [row["id"] for row in date_desc],
+            [third_id, first_id, second_id],
+        )
+        self.assertEqual(
+            [row["id"] for row in date_asc],
+            [second_id, first_id, third_id],
+        )
+        self.assertEqual(
+            [
+                row["id"]
+                for row in [
+                    *length_desc_page_one,
+                    *length_desc_page_two,
+                ]
+            ],
+            [third_id, first_id, second_id],
+        )
+        self.assertEqual(
+            [row["id"] for row in length_asc],
+            [second_id, first_id, third_id],
+        )
+
+    async def test_saved_message_sort_rejects_unvalidated_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Invalid saved-item sort"):
+            await database.get_saved_messages(
+                saved_by_user_id="user-1",
+                sort="NOT_A_SORT",
+            )
+
     async def test_status_update_validates_value_record_and_owner(self) -> None:
         _, record_id = await self.save_message(message_id="message-1")
 

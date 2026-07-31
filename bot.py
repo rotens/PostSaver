@@ -10,6 +10,7 @@ from database import (
     AttachmentToSave,
     MessageToSave,
     PendingRangeChangedError,
+    SavedItemSort,
     SavedMessageFilters,
     count_saved_batches,
     count_saved_messages_in_batch,
@@ -30,6 +31,7 @@ from database import (
     is_user_ignored,
     save_message_range_as_batch,
     save_unread_message,
+    saved_message_filters_are_active,
     set_pending_range_start,
     unignore_all_users,
     unignore_user,
@@ -243,6 +245,7 @@ def format_active_saved_filters(
     filters: SavedMessageFilters,
     date_from: str | None,
     date_to: str | None,
+    sort: SavedItemSort = SavedItemSort.DEFAULT,
 ) -> str:
     parts = [f"Status: `{filters.status}`"]
 
@@ -273,7 +276,42 @@ def format_active_saved_filters(
             f"`{normalized_date_to or 'any'}`"
         )
 
+    if sort != SavedItemSort.DEFAULT:
+        parts.append(f"Sort: `{saved_item_sort_label(sort)}`")
+
     return "Active filters: " + " • ".join(parts)
+
+
+def saved_item_sort_label(sort: SavedItemSort) -> str:
+    return {
+        SavedItemSort.DEFAULT: "Default",
+        SavedItemSort.DATE_DESC: "Date descending",
+        SavedItemSort.DATE_ASC: "Date ascending",
+        SavedItemSort.LENGTH_DESC: "Length descending",
+        SavedItemSort.LENGTH_ASC: "Length ascending",
+    }[sort]
+
+
+def saved_item_sort_choices() -> list[app_commands.Choice[str]]:
+    return [
+        app_commands.Choice(
+            name=saved_item_sort_label(sort),
+            value=sort.value,
+        )
+        for sort in SavedItemSort
+    ]
+
+
+def resolve_saved_item_sort(
+    choice: app_commands.Choice[str] | None,
+) -> SavedItemSort:
+    if choice is None:
+        return SavedItemSort.DEFAULT
+
+    try:
+        return SavedItemSort(choice.value)
+    except ValueError as error:
+        raise ValueError("Invalid sort option.") from error
 
 
 def _autocomplete_choice_name(label: str, discord_id: str) -> str:
@@ -1135,11 +1173,13 @@ def create_saved_batch_summary_embed(
     attachments,
     page: int,
     total_pages: int,
+    filters_active: bool,
 ) -> discord.Embed:
     title = row["title"] or f'Untitled batch #{row["id"]}'
-    message_count = row["message_count"]
+    total_message_count = row["total_message_count"]
+    matching_message_count = row["matching_message_count"]
 
-    if message_count == 0:
+    if total_message_count == 0:
         description = "*This batch currently has no messages.*"
     else:
         content = row["first_message_content"].strip()
@@ -1159,10 +1199,32 @@ def create_saved_batch_summary_embed(
                 + "..."
             )
 
+        first_link_label = (
+            "Open first matching message"
+            if filters_active
+            else "Open first message"
+        )
+        message_links = [
+            f'[{first_link_label}]({row["first_message_jump_url"]})'
+        ]
+
+        if (
+            row["last_message_record_id"]
+            != row["first_message_record_id"]
+        ):
+            last_link_label = (
+                "Open last matching message"
+                if filters_active
+                else "Open last message"
+            )
+            message_links.append(
+                f'[{last_link_label}]({row["last_message_jump_url"]})'
+            )
+
         description = (
             f'**First message by {row["first_message_author_name"]}**\n'
             f"{content}\n\n"
-            f'[Open first message]({row["first_message_jump_url"]})'
+            + " • ".join(message_links)
         )
 
     embed = discord.Embed(
@@ -1175,11 +1237,15 @@ def create_saved_batch_summary_embed(
         inline=False,
     )
     embed.add_field(
-        name="Messages",
-        value=str(message_count),
+        name="Matching messages" if filters_active else "Messages",
+        value=(
+            f"{matching_message_count} of {total_message_count}"
+            if filters_active
+            else str(total_message_count)
+        ),
         inline=False,
     )
-    if message_count > 0:
+    if matching_message_count > 0:
         add_location_to_embed(
             embed,
             guild_id=row["first_message_guild_id"],
@@ -1268,6 +1334,7 @@ async def get_saved_batch_detail_page(
     batch_id: int,
     saved_by_user_id: str,
     requested_page: int,
+    filters: SavedMessageFilters | None = None,
 ) -> SavedBatchDetailPage | None:
     if requested_page < 1:
         raise ValueError("Page number must be at least 1")
@@ -1275,6 +1342,7 @@ async def get_saved_batch_detail_page(
     total_messages = await count_saved_messages_in_batch(
         batch_id=batch_id,
         saved_by_user_id=saved_by_user_id,
+        filters=filters,
     )
 
     if total_messages == 0:
@@ -1288,6 +1356,7 @@ async def get_saved_batch_detail_page(
     rows = await get_saved_messages_in_batch(
         batch_id=batch_id,
         saved_by_user_id=saved_by_user_id,
+        filters=filters,
         limit=BATCH_DETAIL_PAGE_SIZE,
         offset=offset,
     )
@@ -1341,6 +1410,8 @@ class BatchDetailView(discord.ui.View):
         title: str | None,
         current_page: int,
         total_pages: int,
+        filters: SavedMessageFilters | None = None,
+        sort: SavedItemSort = SavedItemSort.DEFAULT,
     ) -> None:
         super().__init__(timeout=600)
         self.batch_id = batch_id
@@ -1348,6 +1419,8 @@ class BatchDetailView(discord.ui.View):
         self.title = title
         self.current_page = current_page
         self.total_pages = total_pages
+        self.filters = filters
+        self.sort = sort
         self.refresh_buttons()
 
     def refresh_buttons(self) -> None:
@@ -1377,12 +1450,18 @@ class BatchDetailView(discord.ui.View):
             batch_id=self.batch_id,
             saved_by_user_id=str(self.owner_user_id),
             requested_page=requested_page,
+            filters=self.filters,
         )
 
         if page is None:
             self.stop()
+            empty_message = (
+                "No messages in this batch match the active filters."
+                if saved_message_filters_are_active(self.filters)
+                else "This batch no longer contains any saved messages."
+            )
             await interaction.edit_original_response(
-                content="This batch no longer contains any saved messages.",
+                content=empty_message,
                 embeds=[],
                 view=None,
             )
@@ -1432,17 +1511,25 @@ async def open_saved_batch_detail(
     *,
     batch_id: int,
     title: str | None,
+    filters: SavedMessageFilters | None = None,
+    sort: SavedItemSort = SavedItemSort.DEFAULT,
 ) -> None:
     await interaction.response.defer(ephemeral=True, thinking=True)
     page = await get_saved_batch_detail_page(
         batch_id=batch_id,
         saved_by_user_id=str(interaction.user.id),
         requested_page=1,
+        filters=filters,
     )
 
     if page is None:
+        empty_message = (
+            "No messages in this batch match the active filters."
+            if saved_message_filters_are_active(filters)
+            else "This batch no longer contains any saved messages."
+        )
         await interaction.edit_original_response(
-            content="This batch no longer contains any saved messages.",
+            content=empty_message,
         )
         return
 
@@ -1452,6 +1539,8 @@ async def open_saved_batch_detail(
         title=title,
         current_page=page.current_page,
         total_pages=page.total_pages,
+        filters=filters,
+        sort=sort,
     )
     await interaction.edit_original_response(
         content=create_saved_batch_detail_header(
@@ -1472,11 +1561,15 @@ class BatchSummaryView(discord.ui.View):
         owner_user_id: int,
         title: str | None,
         message_count: int,
+        filters: SavedMessageFilters | None = None,
+        sort: SavedItemSort = SavedItemSort.DEFAULT,
     ) -> None:
         super().__init__(timeout=600)
         self.batch_id = batch_id
         self.owner_user_id = owner_user_id
         self.title = title
+        self.filters = filters
+        self.sort = sort
         self.view_batch.disabled = message_count == 0
 
     async def interaction_check(
@@ -1506,6 +1599,8 @@ class BatchSummaryView(discord.ui.View):
             interaction,
             batch_id=self.batch_id,
             title=self.title,
+            filters=self.filters,
+            sort=self.sort,
         )
 
 
@@ -1515,20 +1610,92 @@ class BatchSummaryView(discord.ui.View):
 )
 @app_commands.describe(
     page="Choose which page to show",
+    status="Choose which saved-message status to include",
+    keyword="Find text in batch titles or message content",
+    date_from="Original message date from YYYY-MM-DD",
+    date_to="Original message date through YYYY-MM-DD",
+    author_id="Message author (autocomplete or Discord ID)",
+    channel_id="Channel (autocomplete or Discord ID)",
+    guild_id="Server (autocomplete or Discord ID)",
+    all_locations="Search all locations instead of the current channel",
+    sort="Order batches by date or total matching text length",
+)
+@app_commands.choices(
+    status=[
+        app_commands.Choice(
+            name="Unread",
+            value="UNREAD",
+        ),
+        app_commands.Choice(
+            name="Read and kept",
+            value="READ_KEEP",
+        ),
+        app_commands.Choice(
+            name="All",
+            value="ALL",
+        ),
+    ],
+    sort=saved_item_sort_choices(),
 )
 async def show_saved_batches(
     interaction: discord.Interaction,
     page: app_commands.Range[int, 1] = 1,
+    status: app_commands.Choice[str] | None = None,
+    keyword: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    author_id: str | None = None,
+    channel_id: str | None = None,
+    guild_id: str | None = None,
+    all_locations: bool = False,
+    sort: app_commands.Choice[str] | None = None,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
 
+    selected_status = status.value if status else "ALL"
+
+    try:
+        selected_sort = resolve_saved_item_sort(sort)
+        filters = create_saved_message_filters(
+            selected_status=selected_status,
+            keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
+            author_id=author_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            all_locations=all_locations,
+            current_guild_id=interaction.guild_id,
+            current_channel_id=interaction.channel_id,
+        )
+    except ValueError as error:
+        await interaction.edit_original_response(content=str(error))
+        return
+
+    filters_active = saved_message_filters_are_active(filters)
+    active_filters = format_active_saved_filters(
+        filters=filters,
+        date_from=date_from,
+        date_to=date_to,
+        sort=selected_sort,
+    )
+
     total_batches = await count_saved_batches(
         saved_by_user_id=str(interaction.user.id),
+        filters=filters,
     )
 
     if total_batches == 0:
+        if filters_active:
+            empty_message = (
+                "No saved message batches contain matching messages.\n"
+                f"{active_filters}"
+            )
+        else:
+            empty_message = "You have no saved message batches."
+
         await interaction.edit_original_response(
-            content="You have no saved message batches.",
+            content=empty_message,
         )
         return
 
@@ -1540,13 +1707,16 @@ async def show_saved_batches(
         await interaction.edit_original_response(
             content=(
                 f"Page `{page}` does not exist. "
-                f"You have {total_pages} batch page(s)."
+                f"The filtered results have {total_pages} batch page(s).\n"
+                f"{active_filters}"
             ),
         )
         return
 
     rows = await get_saved_batches(
         saved_by_user_id=str(interaction.user.id),
+        filters=filters,
+        sort=selected_sort,
         limit=SAVED_BATCHES_PAGE_SIZE,
         offset=(page - 1) * SAVED_BATCHES_PAGE_SIZE,
     )
@@ -1568,19 +1738,23 @@ async def show_saved_batches(
             ),
             page=page,
             total_pages=total_pages,
+            filters_active=filters_active,
         )
         view = BatchSummaryView(
             batch_id=row["id"],
             owner_user_id=interaction.user.id,
             title=row["title"],
-            message_count=row["message_count"],
+            message_count=row["matching_message_count"],
+            filters=filters,
+            sort=selected_sort,
         )
 
         if index == 0:
             await interaction.edit_original_response(
                 content=(
                     "Your saved message batches — "
-                    f"page {page}/{total_pages}"
+                    f"page {page}/{total_pages}\n"
+                    f"{active_filters}"
                 ),
                 embed=embed,
                 view=view,
@@ -1591,6 +1765,30 @@ async def show_saved_batches(
                 view=view,
                 ephemeral=True,
             )
+
+
+@show_saved_batches.autocomplete("author_id")
+async def batches_author_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    return await saved_author_autocomplete(interaction, current)
+
+
+@show_saved_batches.autocomplete("channel_id")
+async def batches_channel_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    return await saved_channel_autocomplete(interaction, current)
+
+
+@show_saved_batches.autocomplete("guild_id")
+async def batches_guild_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    return await saved_guild_autocomplete(interaction, current)
 
 
 @bot.tree.command(
@@ -1607,6 +1805,7 @@ async def show_saved_batches(
     channel_id="Channel (autocomplete or Discord ID)",
     guild_id="Server (autocomplete or Discord ID)",
     all_locations="Search all locations instead of the current channel",
+    sort="Order messages by original date or text length",
 )
 @app_commands.choices(
     status=[
@@ -1623,6 +1822,7 @@ async def show_saved_batches(
             value="ALL",
         ),
     ],
+    sort=saved_item_sort_choices(),
 )
 async def show_saved_messages(
     interaction: discord.Interaction,
@@ -1635,6 +1835,7 @@ async def show_saved_messages(
     channel_id: str | None = None,
     guild_id: str | None = None,
     all_locations: bool = False,
+    sort: app_commands.Choice[str] | None = None,
 ) -> None:
     print("/saved handler started")
     print("user:", interaction.user.id)
@@ -1644,6 +1845,7 @@ async def show_saved_messages(
     await interaction.response.defer(ephemeral=True)
 
     try:
+        selected_sort = resolve_saved_item_sort(sort)
         filters = create_saved_message_filters(
             selected_status=selected_status,
             keyword=keyword,
@@ -1664,6 +1866,7 @@ async def show_saved_messages(
         filters=filters,
         date_from=date_from,
         date_to=date_to,
+        sort=selected_sort,
     )
 
     total_records = await count_saved_messages(
@@ -1697,6 +1900,7 @@ async def show_saved_messages(
     rows = await get_saved_messages(
         saved_by_user_id=str(interaction.user.id),
         filters=filters,
+        sort=selected_sort,
         limit=SAVED_MESSAGES_PAGE_SIZE,
         offset=(page - 1) * SAVED_MESSAGES_PAGE_SIZE,
     )
@@ -1811,17 +2015,6 @@ async def saved_channel_autocomplete(
 
         if not selected_guild_id.isdecimal():
             selected_guild_id = None
-
-    if selected_guild_id is None and not getattr(
-        interaction.namespace,
-        "all_locations",
-        False,
-    ):
-        selected_guild_id = (
-            str(interaction.guild_id)
-            if interaction.guild_id is not None
-            else None
-        )
 
     rows = await get_saved_channel_autocomplete_choices(
         saved_by_user_id=str(interaction.user.id),

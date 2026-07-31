@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import aiosqlite
@@ -47,6 +48,14 @@ class SavedMessageFilters:
     author_id: str | None = None
     channel_id: str | None = None
     guild_id: str | None = None
+
+
+class SavedItemSort(StrEnum):
+    DEFAULT = "DEFAULT"
+    DATE_DESC = "DATE_DESC"
+    DATE_ASC = "DATE_ASC"
+    LENGTH_DESC = "LENGTH_DESC"
+    LENGTH_ASC = "LENGTH_ASC"
 
 
 @dataclass(frozen=True)
@@ -487,35 +496,169 @@ async def associate_saved_messages_with_batch(
 async def count_saved_batches(
     *,
     saved_by_user_id: str,
+    filters: SavedMessageFilters | None = None,
 ) -> int:
-    query = """
-    SELECT COUNT(*)
-    FROM saved_batches
-    WHERE saved_by_user_id = ?;
-    """
+    if not saved_message_filters_are_active(filters):
+        query = """
+        SELECT COUNT(*)
+        FROM saved_batches
+        WHERE saved_by_user_id = ?;
+        """
+        values: list[str | int] = [saved_by_user_id]
+    else:
+        assert filters is not None
+        where_clause, values = _build_batch_message_filter_clause(
+            saved_by_user_id=saved_by_user_id,
+            filters=filters,
+        )
+        query = f"""
+        SELECT COUNT(DISTINCT saved_batch.id)
+        FROM saved_batches AS saved_batch
+        JOIN saved_batch_messages AS batch_message
+          ON batch_message.batch_id = saved_batch.id
+        JOIN saved_messages AS saved_message
+          ON saved_message.id = batch_message.saved_message_id
+         AND saved_message.saved_by_user_id = saved_batch.saved_by_user_id
+        WHERE {where_clause};
+        """
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
-        cursor = await database.execute(
-            query,
-            (saved_by_user_id,),
-        )
+        cursor = await database.execute(query, values)
         row = await cursor.fetchone()
 
         return row[0]
 
 
+def saved_message_filters_are_active(
+    filters: SavedMessageFilters | None,
+) -> bool:
+    if filters is None:
+        return False
+
+    return (
+        filters.status != "ALL"
+        or filters.keyword is not None
+        or filters.created_from is not None
+        or filters.created_before is not None
+        or filters.author_id is not None
+        or filters.channel_id is not None
+        or filters.guild_id is not None
+    )
+
+
+def _build_batch_message_filter_clause(
+    *,
+    saved_by_user_id: str,
+    filters: SavedMessageFilters,
+    batch_alias: str = "saved_batch",
+    message_alias: str = "saved_message",
+) -> tuple[str, list[str | int]]:
+    conditions = [f"{batch_alias}.saved_by_user_id = ?"]
+    values: list[str | int] = [saved_by_user_id]
+
+    if filters.status != "ALL":
+        conditions.append(f"{message_alias}.status = ?")
+        values.append(filters.status)
+
+    if filters.keyword is not None:
+        escaped_keyword = _escape_like_keyword(filters.keyword)
+        pattern = f"%{escaped_keyword}%"
+        conditions.append(
+            "("
+            f"LOWER({message_alias}.content) "
+            "LIKE LOWER(?) ESCAPE '!' "
+            "OR "
+            f"LOWER(COALESCE({batch_alias}.title, '')) "
+            "LIKE LOWER(?) ESCAPE '!'"
+            ")"
+        )
+        values.extend((pattern, pattern))
+
+    if filters.created_from is not None:
+        conditions.append(f"{message_alias}.message_created_at >= ?")
+        values.append(filters.created_from)
+
+    if filters.created_before is not None:
+        conditions.append(f"{message_alias}.message_created_at < ?")
+        values.append(filters.created_before)
+
+    if filters.author_id is not None:
+        conditions.append(f"{message_alias}.author_id = ?")
+        values.append(filters.author_id)
+
+    if filters.channel_id is not None:
+        conditions.append(f"{message_alias}.channel_id = ?")
+        values.append(filters.channel_id)
+
+    if filters.guild_id is not None:
+        conditions.append(f"{message_alias}.guild_id = ?")
+        values.append(filters.guild_id)
+
+    return " AND ".join(conditions), values
+
+
+def _saved_batch_order_by(
+    sort: SavedItemSort,
+    *,
+    filters_active: bool,
+) -> str:
+    _validate_saved_item_sort(sort)
+    length_column = (
+        "matching_content_length"
+        if filters_active
+        else "total_content_length"
+    )
+    return {
+        SavedItemSort.DEFAULT: (
+            "saved_batch.created_at DESC, saved_batch.id DESC"
+        ),
+        SavedItemSort.DATE_DESC: (
+            "saved_batch.created_at DESC, saved_batch.id DESC"
+        ),
+        SavedItemSort.DATE_ASC: (
+            "saved_batch.created_at ASC, saved_batch.id ASC"
+        ),
+        SavedItemSort.LENGTH_DESC: (
+            f"{length_column} DESC, saved_batch.id DESC"
+        ),
+        SavedItemSort.LENGTH_ASC: (
+            f"{length_column} ASC, saved_batch.id ASC"
+        ),
+    }[sort]
+
+
 async def get_saved_batches(
     *,
     saved_by_user_id: str,
+    filters: SavedMessageFilters | None = None,
+    sort: SavedItemSort = SavedItemSort.DEFAULT,
     limit: int = 5,
     offset: int = 0,
 ) -> list[aiosqlite.Row]:
-    query = """
-    WITH batch_stats AS (
+    selected_filters = filters or SavedMessageFilters(status="ALL")
+    filters_active = saved_message_filters_are_active(filters)
+    matching_where_clause, matching_values = (
+        _build_batch_message_filter_clause(
+            saved_by_user_id=saved_by_user_id,
+            filters=selected_filters,
+            batch_alias="owned_batch",
+        )
+    )
+    matching_batch_requirement = (
+        "AND matching_stats.batch_id IS NOT NULL"
+        if filters_active
+        else ""
+    )
+    order_by = _saved_batch_order_by(
+        sort,
+        filters_active=filters_active,
+    )
+    query = f"""
+    WITH total_stats AS (
         SELECT
             batch_messages.batch_id,
-            COUNT(*) AS message_count,
-            MIN(batch_messages.position) AS first_position
+            COUNT(*) AS total_message_count,
+            SUM(LENGTH(saved_message.content)) AS total_content_length
         FROM saved_batch_messages AS batch_messages
         JOIN saved_batches AS owned_batch
           ON owned_batch.id = batch_messages.batch_id
@@ -524,12 +667,36 @@ async def get_saved_batches(
          AND saved_message.saved_by_user_id = owned_batch.saved_by_user_id
         WHERE owned_batch.saved_by_user_id = ?
         GROUP BY batch_messages.batch_id
+    ),
+    matching_stats AS (
+        SELECT
+            batch_messages.batch_id,
+            COUNT(*) AS matching_message_count,
+            SUM(LENGTH(saved_message.content)) AS matching_content_length,
+            MIN(batch_messages.position) AS first_matching_position,
+            MAX(batch_messages.position) AS last_matching_position
+        FROM saved_batch_messages AS batch_messages
+        JOIN saved_batches AS owned_batch
+          ON owned_batch.id = batch_messages.batch_id
+        JOIN saved_messages AS saved_message
+          ON saved_message.id = batch_messages.saved_message_id
+         AND saved_message.saved_by_user_id = owned_batch.saved_by_user_id
+        WHERE {matching_where_clause}
+        GROUP BY batch_messages.batch_id
     )
     SELECT
         saved_batch.id,
         saved_batch.title,
         saved_batch.created_at,
-        COALESCE(batch_stats.message_count, 0) AS message_count,
+        COALESCE(total_stats.total_message_count, 0)
+            AS total_message_count,
+        COALESCE(matching_stats.matching_message_count, 0)
+            AS matching_message_count,
+        COALESCE(total_stats.total_content_length, 0)
+            AS total_content_length,
+        COALESCE(matching_stats.matching_content_length, 0)
+            AS matching_content_length,
+        COALESCE(total_stats.total_message_count, 0) AS message_count,
         first_message.id AS first_message_record_id,
         first_message.guild_id AS first_message_guild_id,
         first_message.guild_name AS first_message_guild_name,
@@ -539,18 +706,31 @@ async def get_saved_batches(
         first_message.content AS first_message_content,
         first_message.jump_url AS first_message_jump_url,
         first_message.message_created_at AS first_message_created_at,
-        first_message.status AS first_message_status
+        first_message.status AS first_message_status,
+        last_message.id AS last_message_record_id,
+        last_message.jump_url AS last_message_jump_url
     FROM saved_batches AS saved_batch
-    LEFT JOIN batch_stats
-      ON batch_stats.batch_id = saved_batch.id
+    LEFT JOIN total_stats
+      ON total_stats.batch_id = saved_batch.id
+    LEFT JOIN matching_stats
+      ON matching_stats.batch_id = saved_batch.id
     LEFT JOIN saved_batch_messages AS first_batch_message
       ON first_batch_message.batch_id = saved_batch.id
-     AND first_batch_message.position = batch_stats.first_position
+     AND first_batch_message.position
+         = matching_stats.first_matching_position
     LEFT JOIN saved_messages AS first_message
       ON first_message.id = first_batch_message.saved_message_id
      AND first_message.saved_by_user_id = saved_batch.saved_by_user_id
+    LEFT JOIN saved_batch_messages AS last_batch_message
+      ON last_batch_message.batch_id = saved_batch.id
+     AND last_batch_message.position
+         = matching_stats.last_matching_position
+    LEFT JOIN saved_messages AS last_message
+      ON last_message.id = last_batch_message.saved_message_id
+     AND last_message.saved_by_user_id = saved_batch.saved_by_user_id
     WHERE saved_batch.saved_by_user_id = ?
-    ORDER BY saved_batch.created_at DESC, saved_batch.id DESC
+      {matching_batch_requirement}
+    ORDER BY {order_by}
     LIMIT ? OFFSET ?;
     """
 
@@ -561,6 +741,7 @@ async def get_saved_batches(
             query,
             (
                 saved_by_user_id,
+                *matching_values,
                 saved_by_user_id,
                 limit,
                 offset,
@@ -574,8 +755,14 @@ async def count_saved_messages_in_batch(
     *,
     batch_id: int,
     saved_by_user_id: str,
+    filters: SavedMessageFilters | None = None,
 ) -> int:
-    query = """
+    selected_filters = filters or SavedMessageFilters(status="ALL")
+    where_clause, values = _build_batch_message_filter_clause(
+        saved_by_user_id=saved_by_user_id,
+        filters=selected_filters,
+    )
+    query = f"""
     SELECT COUNT(*)
     FROM saved_batches AS saved_batch
     JOIN saved_batch_messages AS batch_message
@@ -584,7 +771,7 @@ async def count_saved_messages_in_batch(
       ON saved_message.id = batch_message.saved_message_id
      AND saved_message.saved_by_user_id = saved_batch.saved_by_user_id
     WHERE saved_batch.id = ?
-      AND saved_batch.saved_by_user_id = ?;
+      AND {where_clause};
     """
 
     async with aiosqlite.connect(DATABASE_PATH) as database:
@@ -592,7 +779,7 @@ async def count_saved_messages_in_batch(
             query,
             (
                 batch_id,
-                saved_by_user_id,
+                *values,
             ),
         )
         row = await cursor.fetchone()
@@ -604,10 +791,16 @@ async def get_saved_messages_in_batch(
     *,
     batch_id: int,
     saved_by_user_id: str,
+    filters: SavedMessageFilters | None = None,
     limit: int = 5,
     offset: int = 0,
 ) -> list[aiosqlite.Row]:
-    query = """
+    selected_filters = filters or SavedMessageFilters(status="ALL")
+    where_clause, values = _build_batch_message_filter_clause(
+        saved_by_user_id=saved_by_user_id,
+        filters=selected_filters,
+    )
+    query = f"""
     SELECT
         saved_message.id,
         saved_message.guild_id,
@@ -627,7 +820,7 @@ async def get_saved_messages_in_batch(
       ON saved_message.id = batch_message.saved_message_id
      AND saved_message.saved_by_user_id = saved_batch.saved_by_user_id
     WHERE saved_batch.id = ?
-      AND saved_batch.saved_by_user_id = ?
+      AND {where_clause}
     ORDER BY batch_message.position ASC
     LIMIT ? OFFSET ?;
     """
@@ -639,7 +832,7 @@ async def get_saved_messages_in_batch(
             query,
             (
                 batch_id,
-                saved_by_user_id,
+                *values,
                 limit,
                 offset,
             ),
@@ -1091,10 +1284,38 @@ def _build_saved_message_filter_clause(
     return " AND ".join(conditions), values
 
 
+def _validate_saved_item_sort(sort: SavedItemSort) -> None:
+    if not isinstance(sort, SavedItemSort):
+        raise ValueError(f"Invalid saved-item sort: {sort}")
+
+
+def _saved_message_order_by(sort: SavedItemSort) -> str:
+    _validate_saved_item_sort(sort)
+    return {
+        SavedItemSort.DEFAULT: (
+            "saved_message.saved_at DESC, saved_message.id DESC"
+        ),
+        SavedItemSort.DATE_DESC: (
+            "saved_message.message_created_at DESC, "
+            "saved_message.id DESC"
+        ),
+        SavedItemSort.DATE_ASC: (
+            "saved_message.message_created_at ASC, saved_message.id ASC"
+        ),
+        SavedItemSort.LENGTH_DESC: (
+            "LENGTH(saved_message.content) DESC, saved_message.id DESC"
+        ),
+        SavedItemSort.LENGTH_ASC: (
+            "LENGTH(saved_message.content) ASC, saved_message.id ASC"
+        ),
+    }[sort]
+
+
 async def get_saved_messages(
     *,
     saved_by_user_id: str,
     filters: SavedMessageFilters | None = None,
+    sort: SavedItemSort = SavedItemSort.DEFAULT,
     limit: int = 10,
     offset: int = 0,
 ) -> list[aiosqlite.Row]:
@@ -1103,6 +1324,7 @@ async def get_saved_messages(
         saved_by_user_id=saved_by_user_id,
         filters=selected_filters,
     )
+    order_by = _saved_message_order_by(sort)
     query = f"""
     SELECT
         saved_message.id,
@@ -1117,7 +1339,7 @@ async def get_saved_messages(
         saved_message.status
     FROM saved_messages AS saved_message
     WHERE {where_clause}
-    ORDER BY saved_message.saved_at DESC, saved_message.id DESC
+    ORDER BY {order_by}
     LIMIT ? OFFSET ?
     """
 
