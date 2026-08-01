@@ -65,7 +65,20 @@ class RangeSaveResult:
     already_saved_count: int
 
 
+@dataclass(frozen=True)
+class ManualBatchAddResult:
+    batch_id: int
+    saved_message_id: int
+    message_was_saved: bool
+    association_was_created: bool
+    position: int
+
+
 class PendingRangeChangedError(RuntimeError):
+    pass
+
+
+class SavedBatchNotFoundError(LookupError):
     pass
 
 
@@ -491,6 +504,294 @@ async def associate_saved_messages_with_batch(
         await database.commit()
 
     return associated_count
+
+
+async def get_recent_saved_batches(
+    *,
+    saved_by_user_id: str,
+    limit: int = 25,
+) -> list[aiosqlite.Row]:
+    if not 1 <= limit <= 25:
+        raise ValueError("Recent batch limit must be between 1 and 25")
+
+    query = """
+    SELECT
+        saved_batch.id,
+        saved_batch.title,
+        saved_batch.created_at,
+        COUNT(batch_message.saved_message_id) AS message_count
+    FROM saved_batches AS saved_batch
+    LEFT JOIN saved_batch_messages AS batch_message
+      ON batch_message.batch_id = saved_batch.id
+    WHERE saved_batch.saved_by_user_id = ?
+    GROUP BY saved_batch.id
+    ORDER BY saved_batch.created_at DESC, saved_batch.id DESC
+    LIMIT ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        database.row_factory = aiosqlite.Row
+        cursor = await database.execute(
+            query,
+            (
+                saved_by_user_id,
+                limit,
+            ),
+        )
+
+        return await cursor.fetchall()
+
+
+async def _save_message_for_manual_batch(
+    database: aiosqlite.Connection,
+    *,
+    saved_by_user_id: str,
+    message: MessageToSave,
+) -> tuple[int, bool]:
+    save_message_query = """
+    INSERT OR IGNORE INTO saved_messages (
+        saved_by_user_id,
+        message_id,
+        guild_id,
+        guild_name,
+        channel_id,
+        channel_name,
+        author_id,
+        author_name,
+        content,
+        jump_url,
+        message_created_at,
+        status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
+    """
+    get_saved_message_query = """
+    SELECT id
+    FROM saved_messages
+    WHERE saved_by_user_id = ?
+      AND message_id = ?;
+    """
+
+    cursor = await database.execute(
+        save_message_query,
+        (
+            saved_by_user_id,
+            message.message_id,
+            message.guild_id,
+            message.guild_name,
+            message.channel_id,
+            message.channel_name,
+            message.author_id,
+            message.author_name,
+            message.content,
+            message.jump_url,
+            message.message_created_at,
+        ),
+    )
+    message_was_saved = cursor.rowcount == 1
+
+    cursor = await database.execute(
+        get_saved_message_query,
+        (
+            saved_by_user_id,
+            message.message_id,
+        ),
+    )
+    row = await cursor.fetchone()
+
+    if row is None:
+        raise RuntimeError("Failed to find saved message record")
+
+    saved_message_id = row[0]
+    await _insert_saved_message_attachments(
+        database,
+        saved_message_id=saved_message_id,
+        attachments=message.attachments,
+    )
+
+    return saved_message_id, message_was_saved
+
+
+async def _append_saved_message_to_batch(
+    database: aiosqlite.Connection,
+    *,
+    batch_id: int,
+    saved_message_id: int,
+) -> tuple[bool, int]:
+    existing_association_query = """
+    SELECT position
+    FROM saved_batch_messages
+    WHERE batch_id = ?
+      AND saved_message_id = ?;
+    """
+    next_position_query = """
+    SELECT COALESCE(MAX(position), -1) + 1
+    FROM saved_batch_messages
+    WHERE batch_id = ?;
+    """
+    associate_message_query = """
+    INSERT INTO saved_batch_messages (
+        batch_id,
+        saved_message_id,
+        position
+    )
+    VALUES (?, ?, ?);
+    """
+
+    cursor = await database.execute(
+        existing_association_query,
+        (
+            batch_id,
+            saved_message_id,
+        ),
+    )
+    row = await cursor.fetchone()
+
+    if row is not None:
+        return False, row[0]
+
+    cursor = await database.execute(next_position_query, (batch_id,))
+    row = await cursor.fetchone()
+
+    if row is None:
+        raise RuntimeError("Failed to calculate batch message position")
+
+    position = row[0]
+    await database.execute(
+        associate_message_query,
+        (
+            batch_id,
+            saved_message_id,
+            position,
+        ),
+    )
+
+    return True, position
+
+
+async def add_message_to_saved_batch(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+    message: MessageToSave,
+) -> ManualBatchAddResult:
+    _validate_attachments(message.attachments)
+    find_owned_batch_query = """
+    SELECT 1
+    FROM saved_batches
+    WHERE id = ?
+      AND saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        try:
+            await database.execute("BEGIN IMMEDIATE;")
+            cursor = await database.execute(
+                find_owned_batch_query,
+                (
+                    batch_id,
+                    saved_by_user_id,
+                ),
+            )
+
+            if await cursor.fetchone() is None:
+                raise SavedBatchNotFoundError(
+                    "Saved batch does not exist for this user"
+                )
+
+            saved_message_id, message_was_saved = (
+                await _save_message_for_manual_batch(
+                    database,
+                    saved_by_user_id=saved_by_user_id,
+                    message=message,
+                )
+            )
+            association_was_created, position = (
+                await _append_saved_message_to_batch(
+                    database,
+                    batch_id=batch_id,
+                    saved_message_id=saved_message_id,
+                )
+            )
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return ManualBatchAddResult(
+        batch_id=batch_id,
+        saved_message_id=saved_message_id,
+        message_was_saved=message_was_saved,
+        association_was_created=association_was_created,
+        position=position,
+    )
+
+
+async def create_saved_batch_with_message(
+    *,
+    saved_by_user_id: str,
+    title: str | None,
+    message: MessageToSave,
+) -> ManualBatchAddResult:
+    _validate_attachments(message.attachments)
+    normalized_title = title.strip() if title else None
+
+    if not normalized_title:
+        normalized_title = None
+
+    create_batch_query = """
+    INSERT INTO saved_batches (
+        saved_by_user_id,
+        title
+    )
+    VALUES (?, ?);
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        try:
+            await database.execute("BEGIN IMMEDIATE;")
+            cursor = await database.execute(
+                create_batch_query,
+                (
+                    saved_by_user_id,
+                    normalized_title,
+                ),
+            )
+            batch_id = cursor.lastrowid
+
+            if batch_id is None:
+                raise RuntimeError("Failed to create saved batch")
+
+            saved_message_id, message_was_saved = (
+                await _save_message_for_manual_batch(
+                    database,
+                    saved_by_user_id=saved_by_user_id,
+                    message=message,
+                )
+            )
+            association_was_created, position = (
+                await _append_saved_message_to_batch(
+                    database,
+                    batch_id=batch_id,
+                    saved_message_id=saved_message_id,
+                )
+            )
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return ManualBatchAddResult(
+        batch_id=batch_id,
+        saved_message_id=saved_message_id,
+        message_was_saved=message_was_saved,
+        association_was_created=association_was_created,
+        position=position,
+    )
 
 
 async def count_saved_batches(

@@ -8,18 +8,24 @@ from dotenv import load_dotenv
 
 from database import (
     AttachmentToSave,
+    ManualBatchAddResult,
     MessageToSave,
     PendingRangeChangedError,
+    SavedBatchNotFoundError,
     SavedItemSort,
     SavedMessageFilters,
+    add_message_to_saved_batch,
     count_saved_batches,
     count_saved_messages_in_batch,
     count_saved_messages,
+    create_saved_batch,
+    create_saved_batch_with_message,
     delete_pending_range_if_matches,
     delete_saved_message,
     get_ignored_user_ids,
     get_attachments_for_saved_messages,
     get_pending_range,
+    get_recent_saved_batches,
     get_saved_author_autocomplete_choices,
     get_saved_batches,
     get_saved_channel_autocomplete_choices,
@@ -49,6 +55,8 @@ BATCH_PREVIEW_CONTENT_LIMIT = 350
 BATCH_DETAIL_CONTENT_LIMIT = 400
 SAVED_ATTACHMENT_FIELD_VALUE_LIMIT = 1024
 BATCH_ATTACHMENT_FIELD_VALUE_LIMIT = 400
+BATCH_TITLE_MAX_LENGTH = 100
+RECENT_BATCH_PICKER_LIMIT = 25
 MAX_RANGE_MESSAGES_TO_SCAN = 1000
 MAX_SAVED_MESSAGES_PER_RANGE = 300
 
@@ -536,35 +544,36 @@ async def get_messages_in_range(
     return messages
 
 
+def prepare_message_to_save(
+    message: discord.Message,
+    *,
+    position: int,
+) -> MessageToSave:
+    guild_name, channel_name = get_message_location_names(message)
+
+    return MessageToSave(
+        message_id=str(message.id),
+        guild_id=str(message.guild.id) if message.guild else None,
+        guild_name=guild_name,
+        channel_id=str(message.channel.id),
+        channel_name=channel_name,
+        author_id=str(message.author.id),
+        author_name=str(message.author),
+        content=message.content,
+        jump_url=message.jump_url,
+        message_created_at=message.created_at.isoformat(),
+        position=position,
+        attachments=prepare_attachments_to_save(message.attachments),
+    )
+
+
 def prepare_messages_to_save(
     messages: list[discord.Message],
 ) -> list[MessageToSave]:
-    messages_to_save = []
-
-    for position, message in enumerate(messages):
-        guild_name, channel_name = get_message_location_names(message)
-        messages_to_save.append(
-            MessageToSave(
-                message_id=str(message.id),
-                guild_id=(
-                    str(message.guild.id) if message.guild else None
-                ),
-                guild_name=guild_name,
-                channel_id=str(message.channel.id),
-                channel_name=channel_name,
-                author_id=str(message.author.id),
-                author_name=str(message.author),
-                content=message.content,
-                jump_url=message.jump_url,
-                message_created_at=message.created_at.isoformat(),
-                position=position,
-                attachments=prepare_attachments_to_save(
-                    message.attachments
-                ),
-            )
-        )
-
-    return messages_to_save
+    return [
+        prepare_message_to_save(message, position=position)
+        for position, message in enumerate(messages)
+    ]
 
 
 async def complete_message_range(
@@ -757,7 +766,7 @@ class SaveRangeModal(discord.ui.Modal, title="Save message range"):
         label="Title",
         placeholder="Optional title for this message range",
         required=False,
-        max_length=100,
+        max_length=BATCH_TITLE_MAX_LENGTH,
     )
 
     def __init__(
@@ -790,6 +799,304 @@ class SaveRangeModal(discord.ui.Modal, title="Save message range"):
             expected_start_message_id=self.expected_start_message_id,
             batch_title=self.batch_title.value,
         )
+
+
+def normalize_batch_title_input(title: str | None) -> str | None:
+    normalized_title = title.strip() if title else None
+
+    if not normalized_title:
+        return None
+
+    if len(normalized_title) > BATCH_TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"Batch titles cannot exceed {BATCH_TITLE_MAX_LENGTH} characters."
+        )
+
+    return normalized_title
+
+
+def manual_batch_display_title(
+    *,
+    batch_id: int,
+    title: str | None,
+) -> str:
+    return title or f"Untitled batch #{batch_id}"
+
+
+def format_manual_batch_add_confirmation(
+    *,
+    result: ManualBatchAddResult,
+    title: str | None,
+) -> str:
+    display_title = manual_batch_display_title(
+        batch_id=result.batch_id,
+        title=title,
+    )
+    escaped_title = discord.utils.escape_markdown(display_title)
+
+    if not result.association_was_created:
+        return f"This message already belongs to **{escaped_title}**."
+
+    saved_record_description = (
+        "The message was saved as `UNREAD`."
+        if result.message_was_saved
+        else "Its existing saved-message record was reused."
+    )
+
+    return (
+        f"Added the message to **{escaped_title}** at position "
+        f"{result.position + 1}.\n{saved_record_description}"
+    )
+
+
+@bot.tree.command(
+    name="create_batch",
+    description="Create an empty saved-message batch",
+)
+@app_commands.describe(
+    title="Optional batch title (up to 100 characters)",
+)
+async def create_batch_command(
+    interaction: discord.Interaction,
+    title: str | None = None,
+) -> None:
+    try:
+        normalized_title = normalize_batch_title_input(title)
+    except ValueError as error:
+        await interaction.response.send_message(
+            str(error),
+            ephemeral=True,
+        )
+        return
+
+    batch_id = await create_saved_batch(
+        saved_by_user_id=str(interaction.user.id),
+        title=normalized_title,
+    )
+    display_title = manual_batch_display_title(
+        batch_id=batch_id,
+        title=normalized_title,
+    )
+    escaped_title = discord.utils.escape_markdown(display_title)
+
+    await interaction.response.send_message(
+        (
+            f"Created **{escaped_title}**.\n"
+            "Use `Apps → Add to batch` on a message to add it. "
+            "Empty batches are visible with `/batches all_locations:true`."
+        ),
+        ephemeral=True,
+    )
+
+
+class RecentBatchSelect(discord.ui.Select):
+    def __init__(
+        self,
+        *,
+        picker_view: "ManualBatchPickerView",
+        rows,
+    ) -> None:
+        self.picker_view = picker_view
+        options = []
+
+        for row in rows:
+            display_title = manual_batch_display_title(
+                batch_id=row["id"],
+                title=row["title"],
+            )
+            message_label = (
+                "message" if row["message_count"] == 1 else "messages"
+            )
+            description = (
+                f'{row["message_count"]} {message_label} • '
+                f'Created {row["created_at"]}'
+            )
+            options.append(
+                discord.SelectOption(
+                    label=display_title[:100],
+                    value=str(row["id"]),
+                    description=description[:100],
+                )
+            )
+
+        super().__init__(
+            placeholder="Choose one of your recent batches",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="manual_batch:select",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        batch_id = int(self.values[0])
+        await self.picker_view.add_to_existing_batch(
+            interaction,
+            batch_id=batch_id,
+            title=self.picker_view.batch_titles[batch_id],
+        )
+
+
+class CreateBatchWithMessageModal(
+    discord.ui.Modal,
+    title="Create batch and add message",
+):
+    batch_title = discord.ui.TextInput(
+        label="Title",
+        placeholder="Optional title for this batch",
+        required=False,
+        max_length=BATCH_TITLE_MAX_LENGTH,
+    )
+
+    def __init__(
+        self,
+        *,
+        picker_view: "ManualBatchPickerView",
+    ) -> None:
+        super().__init__(timeout=600)
+        self.picker_view = picker_view
+        self.owner_user_id = picker_view.owner_user_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message(
+                "This batch form belongs to another user.",
+                ephemeral=True,
+            )
+            return
+
+        normalized_title = normalize_batch_title_input(
+            self.batch_title.value
+        )
+        result = await create_saved_batch_with_message(
+            saved_by_user_id=str(self.owner_user_id),
+            title=normalized_title,
+            message=prepare_message_to_save(
+                self.picker_view.message,
+                position=0,
+            ),
+        )
+        self.picker_view.stop()
+        await interaction.response.edit_message(
+            content=format_manual_batch_add_confirmation(
+                result=result,
+                title=normalized_title,
+            ),
+            view=None,
+        )
+
+
+class ManualBatchPickerView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        owner_user_id: int,
+        message: discord.Message,
+        recent_batches,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.owner_user_id = owner_user_id
+        self.message = message
+        self.batch_titles = {
+            row["id"]: row["title"]
+            for row in recent_batches
+        }
+
+        if recent_batches:
+            self.add_item(
+                RecentBatchSelect(
+                    picker_view=self,
+                    rows=recent_batches,
+                )
+            )
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+
+        await interaction.response.send_message(
+            "This batch picker belongs to another user.",
+            ephemeral=True,
+        )
+        return False
+
+    async def add_to_existing_batch(
+        self,
+        interaction: discord.Interaction,
+        *,
+        batch_id: int,
+        title: str | None,
+    ) -> None:
+        try:
+            result = await add_message_to_saved_batch(
+                batch_id=batch_id,
+                saved_by_user_id=str(self.owner_user_id),
+                message=prepare_message_to_save(
+                    self.message,
+                    position=0,
+                ),
+            )
+        except SavedBatchNotFoundError:
+            self.stop()
+            await interaction.response.edit_message(
+                content=(
+                    "That batch no longer exists. Open `Add to batch` "
+                    "again to refresh the list."
+                ),
+                view=None,
+            )
+            return
+
+        self.stop()
+        await interaction.response.edit_message(
+            content=format_manual_batch_add_confirmation(
+                result=result,
+                title=title,
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Create new batch",
+        style=discord.ButtonStyle.primary,
+        custom_id="manual_batch:create",
+    )
+    async def create_new_batch(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_modal(
+            CreateBatchWithMessageModal(picker_view=self)
+        )
+
+
+async def _add_to_batch_context_menu_callback(
+    interaction: discord.Interaction,
+    message: discord.Message,
+) -> None:
+    recent_batches = await get_recent_saved_batches(
+        saved_by_user_id=str(interaction.user.id),
+        limit=RECENT_BATCH_PICKER_LIMIT,
+    )
+    view = ManualBatchPickerView(
+        owner_user_id=interaction.user.id,
+        message=message,
+        recent_batches=recent_batches,
+    )
+    content = (
+        "Choose a batch for this message, or create a new one."
+        if recent_batches
+        else "You have no batches yet. Create one for this message."
+    )
+
+    await interaction.response.send_message(
+        content,
+        view=view,
+        ephemeral=True,
+    )
 
 
 @bot.tree.context_menu(name="Save as UNREAD")
@@ -1023,6 +1330,22 @@ async def save_through_range_end_context_menu(
             end_message=message,
         )
     )
+
+
+# discord.py 2.7.1 still enforces Discord's former five-command limit,
+# while the current Discord API permits fifteen message context commands.
+# Register this sixth command in the tree after the five regular decorators.
+add_to_batch_context_menu = app_commands.ContextMenu(
+    name="Add to batch",
+    callback=_add_to_batch_context_menu_callback,
+)
+bot.tree._context_menus[
+    (
+        add_to_batch_context_menu.name,
+        None,
+        add_to_batch_context_menu.type.value,
+    )
+] = add_to_batch_context_menu
 
 
 class SavedMessageView(discord.ui.View):

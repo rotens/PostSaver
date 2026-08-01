@@ -64,7 +64,8 @@ Authors can be ignored or unignored with:
 - message-author context-menu actions
 
 `Save as UNREAD` and message-range saving both skip messages written by ignored
-authors.
+authors. `Add to batch` is an explicit message selection and therefore allows
+the selected message even when its author is ignored.
 
 ### Saving message ranges
 
@@ -97,6 +98,32 @@ Range behavior:
 
 The pending range start is stored in SQLite and survives bot restarts. Selecting
 another start replaces the previous one.
+
+### Creating and extending batches manually
+
+`/create_batch title:<optional>` creates an empty batch. The response includes
+the batch's display title and explains that empty batches can be found with
+`/batches all_locations:true`.
+
+Right-click a Discord message and select `Apps → Add to batch` to open an
+ephemeral batch picker. It lists up to 25 of the invoking user's most recently
+created batches, including empty batches. Selecting a batch saves the message
+as `UNREAD` when necessary and appends its association to the end of the batch.
+The picker also provides a `Create new batch` button with an optional-title
+modal that creates the batch and adds the selected message atomically.
+
+Manual association behavior:
+
+- existing saved-message records are reused without changing their content or
+  resetting `READ_KEEP` to `UNREAD`;
+- attachment and location metadata are captured for newly saved messages, and
+  attachment metadata can be backfilled for existing records;
+- adding the same message to the same batch again is a no-op;
+- one saved message may belong to several batches;
+- additions are appended in the order selected by the user rather than being
+  rearranged by original-message date;
+- database operations verify batch ownership and transactionally combine
+  message saving, attachment storage, and association creation.
 
 ### Viewing saved batches
 
@@ -278,6 +305,7 @@ place and only replace or clear its data.
 |---|---|
 | `/saved` | Display the user's saved messages with pagination and optional status, keyword, original-date, author, channel, and server filters. |
 | `/batches` | Display and filter paginated batch summaries with read-only message details. |
+| `/create_batch` | Create an empty batch with an optional title. |
 | `/ignore_user` | Ignore messages written by a selected user. |
 | `/unignore_user` | Remove one user from the ignore list. |
 | `/unignore_all` | Reset the user's ignore list. |
@@ -288,6 +316,7 @@ These appear under **Apps** after right-clicking a message.
 
 | Action | Purpose |
 |---|---|
+| `Add to batch` | Save the selected message if necessary and associate it with an existing or new batch. |
 | `Save as UNREAD` | Save one selected message. |
 | `Ignore message author` | Add the selected message's author to the ignore list. |
 | `Unignore message author` | Remove the selected message's author from the ignore list. |
@@ -374,7 +403,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 145 tests covering:
+The current suite contains 162 tests covering:
 
 - individual-message storage, duplicate handling, deterministic date/length
   sorting, ordering, and pagination;
@@ -398,6 +427,10 @@ The current suite contains 145 tests covering:
 - batch creation, ownership, ordering, associations, filtered total/matching
   counts and text lengths, first/last matching links, title searches,
   deterministic date/length sorting, and paginated contents;
+- atomic manual message saving and batch association, append ordering,
+  attachment rollback, status preservation, duplicate handling, owner-scoped
+  recent-batch choices, `/create_batch`, batch-picker interactions, and the
+  create-and-add modal;
 - `/batches` filter parsing and autocomplete reuse, active-filter summaries,
   empty states, page validation, per-summary views, filtered detail opening,
   filter-preserving navigation, ownership, attachment rendering, and embed
