@@ -92,12 +92,12 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
             batch_id=17,
             owner_user_id=42,
             title="Architecture",
-            message_count=message_count,
+            total_message_count=message_count,
             filters=filters,
             sort=sort,
         )
 
-    def test_view_button_targets_batch_and_empty_batch_disables_it(
+    def test_view_and_delete_buttons_follow_total_message_count(
         self,
     ) -> None:
         populated_view = self.create_view()
@@ -105,7 +105,9 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(populated_view.batch_id, 17)
         self.assertFalse(populated_view.view_batch.disabled)
+        self.assertTrue(populated_view.delete_empty_batch.disabled)
         self.assertTrue(empty_view.view_batch.disabled)
+        self.assertFalse(empty_view.delete_empty_batch.disabled)
         self.assertEqual(populated_view.timeout, 600)
 
     async def test_interaction_check_is_owner_scoped(self) -> None:
@@ -144,6 +146,47 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
             title="Architecture",
             filters=filters,
             sort=bot.SavedItemSort.LENGTH_DESC,
+        )
+
+    async def test_delete_empty_batch_removes_its_summary_panel(self) -> None:
+        view = self.create_view(message_count=0)
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "delete_empty_saved_batch",
+            new=AsyncMock(return_value=True),
+        ) as delete_batch:
+            await view.delete_empty_batch.callback(interaction)
+
+        delete_batch.assert_awaited_once_with(
+            batch_id=17,
+            saved_by_user_id="42",
+        )
+        interaction.response.edit_message.assert_awaited_once_with(
+            content="The empty batch was deleted.",
+            embed=None,
+            view=None,
+        )
+
+    async def test_delete_empty_batch_handles_stale_summary(self) -> None:
+        view = self.create_view(message_count=0)
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "delete_empty_saved_batch",
+            new=AsyncMock(return_value=False),
+        ):
+            await view.delete_empty_batch.callback(interaction)
+
+        interaction.response.edit_message.assert_awaited_once_with(
+            content=(
+                "The batch could not be deleted. It may already be "
+                "deleted or no longer be empty."
+            ),
+            embed=None,
+            view=None,
         )
 
 

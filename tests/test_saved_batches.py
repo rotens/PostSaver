@@ -109,6 +109,83 @@ class SavedBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[1][0], untitled_batch_id)
         self.assertIsNone(rows[1][2])
 
+    async def test_delete_empty_batch_reports_first_and_repeated_delete(
+        self,
+    ) -> None:
+        batch_id = await database.create_saved_batch(
+            saved_by_user_id="user-1",
+            title="Temporary batch",
+        )
+
+        first_delete = await database.delete_empty_saved_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-1",
+        )
+        repeated_delete = await database.delete_empty_saved_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-1",
+        )
+
+        self.assertTrue(first_delete)
+        self.assertFalse(repeated_delete)
+
+    async def test_delete_empty_batch_rejects_nonempty_batch(self) -> None:
+        saved_message_id = await self.save_message(
+            saved_by_user_id="user-1",
+            message_id="message-1",
+        )
+        batch_id = await database.create_saved_batch(
+            saved_by_user_id="user-1",
+            title="Populated batch",
+        )
+        await database.associate_saved_messages_with_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-1",
+            message_positions=[(saved_message_id, 0)],
+        )
+
+        was_deleted = await database.delete_empty_saved_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-1",
+        )
+
+        async with aiosqlite.connect(database.DATABASE_PATH) as connection:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) FROM saved_batches WHERE id = ?;",
+                (batch_id,),
+            )
+            batch_count = (await cursor.fetchone())[0]
+            cursor = await connection.execute(
+                "SELECT COUNT(*) FROM saved_messages WHERE id = ?;",
+                (saved_message_id,),
+            )
+            message_count = (await cursor.fetchone())[0]
+
+        self.assertFalse(was_deleted)
+        self.assertEqual(batch_count, 1)
+        self.assertEqual(message_count, 1)
+
+    async def test_delete_empty_batch_requires_matching_owner(self) -> None:
+        batch_id = await database.create_saved_batch(
+            saved_by_user_id="user-1",
+            title="Owned batch",
+        )
+
+        was_deleted = await database.delete_empty_saved_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-2",
+        )
+
+        async with aiosqlite.connect(database.DATABASE_PATH) as connection:
+            cursor = await connection.execute(
+                "SELECT saved_by_user_id FROM saved_batches WHERE id = ?;",
+                (batch_id,),
+            )
+            row = await cursor.fetchone()
+
+        self.assertFalse(was_deleted)
+        self.assertEqual(row, ("user-1",))
+
     async def test_associate_messages_preserves_positions(self) -> None:
         message_ids = [
             await self.save_message(

@@ -20,6 +20,7 @@ from database import (
     count_saved_messages,
     create_saved_batch,
     create_saved_batch_with_message,
+    delete_empty_saved_batch,
     delete_pending_range_if_matches,
     delete_saved_message,
     get_ignored_user_ids,
@@ -1883,7 +1884,7 @@ class BatchSummaryView(discord.ui.View):
         batch_id: int,
         owner_user_id: int,
         title: str | None,
-        message_count: int,
+        total_message_count: int,
         filters: SavedMessageFilters | None = None,
         sort: SavedItemSort = SavedItemSort.DEFAULT,
     ) -> None:
@@ -1893,7 +1894,8 @@ class BatchSummaryView(discord.ui.View):
         self.title = title
         self.filters = filters
         self.sort = sort
-        self.view_batch.disabled = message_count == 0
+        self.view_batch.disabled = total_message_count == 0
+        self.delete_empty_batch.disabled = total_message_count != 0
 
     async def interaction_check(
         self,
@@ -1924,6 +1926,36 @@ class BatchSummaryView(discord.ui.View):
             title=self.title,
             filters=self.filters,
             sort=self.sort,
+        )
+
+    @discord.ui.button(
+        label="DELETE EMPTY BATCH",
+        style=discord.ButtonStyle.danger,
+        custom_id="batch_summary:delete_empty",
+    )
+    async def delete_empty_batch(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        was_deleted = await delete_empty_saved_batch(
+            batch_id=self.batch_id,
+            saved_by_user_id=str(self.owner_user_id),
+        )
+        self.stop()
+
+        if was_deleted:
+            message = "The empty batch was deleted."
+        else:
+            message = (
+                "The batch could not be deleted. It may already be "
+                "deleted or no longer be empty."
+            )
+
+        await interaction.response.edit_message(
+            content=message,
+            embed=None,
+            view=None,
         )
 
 
@@ -2067,7 +2099,7 @@ async def show_saved_batches(
             batch_id=row["id"],
             owner_user_id=interaction.user.id,
             title=row["title"],
-            message_count=row["matching_message_count"],
+            total_message_count=row["total_message_count"],
             filters=filters,
             sort=selected_sort,
         )

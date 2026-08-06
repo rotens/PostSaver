@@ -451,6 +451,36 @@ async def create_saved_batch(
         return batch_id
 
 
+async def delete_empty_saved_batch(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+) -> bool:
+    query = """
+    DELETE FROM saved_batches
+    WHERE id = ?
+      AND saved_by_user_id = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM saved_batch_messages
+          WHERE batch_id = saved_batches.id
+      );
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+        cursor = await database.execute(
+            query,
+            (
+                batch_id,
+                saved_by_user_id,
+            ),
+        )
+        await database.commit()
+
+        return cursor.rowcount == 1
+
+
 async def associate_saved_messages_with_batch(
     *,
     batch_id: int,

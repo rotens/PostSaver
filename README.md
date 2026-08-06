@@ -161,9 +161,12 @@ unfiltered length sorting sums every message. Batch detail pages retain the
 selected sort state but continue to display messages in their canonical batch
 position order.
 
-Empty batches remain visible, but their `View batch` button is disabled. Batch
-summaries and details are currently read-only: they do not provide rename,
-delete, or batch-level status controls.
+Empty batches remain visible with `View batch` disabled and
+`DELETE EMPTY BATCH` enabled. Deletion is owner-scoped and succeeds only if the
+batch is still empty when the button is pressed. It removes only the batch
+container and never deletes saved messages. Nonempty batch summaries and batch
+details remain read-only and do not provide rename, deletion, association
+removal, or batch-level status controls.
 
 ### Attachments
 
@@ -403,7 +406,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 162 tests covering:
+The current suite contains 167 tests covering:
 
 - individual-message storage, duplicate handling, deterministic date/length
   sorting, ordering, and pagination;
@@ -431,6 +434,8 @@ The current suite contains 162 tests covering:
   attachment rollback, status preservation, duplicate handling, owner-scoped
   recent-batch choices, `/create_batch`, batch-picker interactions, and the
   create-and-add modal;
+- ownership-safe empty-batch deletion, nonempty-batch protection, summary
+  button states, and stale-panel responses;
 - `/batches` filter parsing and autocomplete reuse, active-filter summaries,
   empty states, page validation, per-summary views, filtered detail opening,
   filter-preserving navigation, ownership, attachment rendering, and embed
