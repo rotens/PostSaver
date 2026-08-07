@@ -346,10 +346,13 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(views[0].view_batch.disabled)
         self.assertTrue(views[0].delete_empty_batch.disabled)
+        self.assertFalse(views[0].delete_batch.disabled)
         self.assertFalse(views[1].view_batch.disabled)
         self.assertTrue(views[1].delete_empty_batch.disabled)
+        self.assertFalse(views[1].delete_batch.disabled)
         self.assertTrue(views[2].view_batch.disabled)
         self.assertFalse(views[2].delete_empty_batch.disabled)
+        self.assertTrue(views[2].delete_batch.disabled)
         self.assertEqual(embeds[0].title, "Architecture")
         self.assertIn("First message by Author 7", embeds[0].description)
         self.assertIn(
@@ -522,6 +525,7 @@ class BatchesCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(count_filters, list_filters)
         self.assertIs(count_filters, view.filters)
         self.assertTrue(view.delete_empty_batch.disabled)
+        self.assertFalse(view.delete_batch.disabled)
         self.assertEqual(
             get_batches.await_args.kwargs["sort"],
             bot.SavedItemSort.LENGTH_DESC,

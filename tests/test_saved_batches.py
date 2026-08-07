@@ -186,6 +186,154 @@ class SavedBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(was_deleted)
         self.assertEqual(row, ("user-1",))
 
+    async def test_delete_saved_batch_removes_only_its_associations(
+        self,
+    ) -> None:
+        first_message_id = await self.save_message(
+            saved_by_user_id="user-1",
+            message_id="message-1",
+        )
+        second_message_id = await self.save_message(
+            saved_by_user_id="user-1",
+            message_id="message-2",
+        )
+        await database.save_unread_message(
+            saved_by_user_id="user-1",
+            message_id="message-1",
+            guild_id="guild-1",
+            channel_id="channel-1",
+            author_id="author-1",
+            author_name="Author",
+            content="Existing content is preserved",
+            jump_url="https://example.com/message-1",
+            message_created_at="2026-07-22T00:00:00+00:00",
+            attachments=(
+                database.AttachmentToSave(
+                    attachment_id="attachment-1",
+                    filename="diagram.png",
+                    url="https://cdn.example.com/diagram.png",
+                    proxy_url="https://proxy.example.com/diagram.png",
+                    content_type="image/png",
+                    size=1024,
+                    description=None,
+                    width=800,
+                    height=600,
+                    position=0,
+                ),
+            ),
+        )
+        deleted_batch_id = await database.create_saved_batch(
+            saved_by_user_id="user-1",
+            title="Delete this batch",
+        )
+        retained_batch_id = await database.create_saved_batch(
+            saved_by_user_id="user-1",
+            title="Keep this batch",
+        )
+        await database.associate_saved_messages_with_batch(
+            batch_id=deleted_batch_id,
+            saved_by_user_id="user-1",
+            message_positions=[
+                (first_message_id, 0),
+                (second_message_id, 1),
+            ],
+        )
+        await database.associate_saved_messages_with_batch(
+            batch_id=retained_batch_id,
+            saved_by_user_id="user-1",
+            message_positions=[(first_message_id, 0)],
+        )
+
+        result = await database.delete_saved_batch(
+            batch_id=deleted_batch_id,
+            saved_by_user_id="user-1",
+        )
+        repeated_result = await database.delete_saved_batch(
+            batch_id=deleted_batch_id,
+            saved_by_user_id="user-1",
+        )
+
+        async with aiosqlite.connect(database.DATABASE_PATH) as connection:
+            cursor = await connection.execute(
+                "SELECT id FROM saved_batches ORDER BY id;"
+            )
+            batches = await cursor.fetchall()
+            cursor = await connection.execute(
+                """
+                SELECT batch_id, saved_message_id, position
+                FROM saved_batch_messages
+                ORDER BY batch_id, position;
+                """
+            )
+            associations = await cursor.fetchall()
+            cursor = await connection.execute(
+                "SELECT id FROM saved_messages ORDER BY id;"
+            )
+            saved_messages = await cursor.fetchall()
+            cursor = await connection.execute(
+                "SELECT attachment_id FROM saved_message_attachments;"
+            )
+            attachments = await cursor.fetchall()
+
+        self.assertEqual(
+            result,
+            database.SavedBatchDeleteResult(
+                batch_id=deleted_batch_id,
+                associations_removed=2,
+            ),
+        )
+        self.assertIsNone(repeated_result)
+        self.assertEqual(batches, [(retained_batch_id,)])
+        self.assertEqual(
+            associations,
+            [(retained_batch_id, first_message_id, 0)],
+        )
+        self.assertEqual(
+            saved_messages,
+            [(first_message_id,), (second_message_id,)],
+        )
+        self.assertEqual(attachments, [("attachment-1",)])
+
+    async def test_delete_saved_batch_requires_matching_owner(self) -> None:
+        saved_message_id = await self.save_message(
+            saved_by_user_id="user-1",
+            message_id="message-1",
+        )
+        batch_id = await database.create_saved_batch(
+            saved_by_user_id="user-1",
+            title="Owned batch",
+        )
+        await database.associate_saved_messages_with_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-1",
+            message_positions=[(saved_message_id, 0)],
+        )
+
+        result = await database.delete_saved_batch(
+            batch_id=batch_id,
+            saved_by_user_id="user-2",
+        )
+
+        async with aiosqlite.connect(database.DATABASE_PATH) as connection:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) FROM saved_batches WHERE id = ?;",
+                (batch_id,),
+            )
+            batch_count = (await cursor.fetchone())[0]
+            cursor = await connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM saved_batch_messages
+                WHERE batch_id = ?;
+                """,
+                (batch_id,),
+            )
+            association_count = (await cursor.fetchone())[0]
+
+        self.assertIsNone(result)
+        self.assertEqual(batch_count, 1)
+        self.assertEqual(association_count, 1)
+
     async def test_associate_messages_preserves_positions(self) -> None:
         message_ids = [
             await self.save_message(

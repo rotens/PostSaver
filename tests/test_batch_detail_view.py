@@ -106,8 +106,10 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(populated_view.batch_id, 17)
         self.assertFalse(populated_view.view_batch.disabled)
         self.assertTrue(populated_view.delete_empty_batch.disabled)
+        self.assertFalse(populated_view.delete_batch.disabled)
         self.assertTrue(empty_view.view_batch.disabled)
         self.assertFalse(empty_view.delete_empty_batch.disabled)
+        self.assertTrue(empty_view.delete_batch.disabled)
         self.assertEqual(populated_view.timeout, 600)
 
     async def test_interaction_check_is_owner_scoped(self) -> None:
@@ -146,6 +148,123 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
             title="Architecture",
             filters=filters,
             sort=bot.SavedItemSort.LENGTH_DESC,
+        )
+
+    async def test_delete_batch_opens_confirmation_with_total_count(
+        self,
+    ) -> None:
+        view = self.create_view(message_count=3)
+        interaction = FakeInteraction()
+
+        await view.delete_batch.callback(interaction)
+
+        edit_call = interaction.response.edit_message.await_args
+        self.assertEqual(
+            edit_call.kwargs["content"],
+            (
+                "Delete **Architecture**?\n"
+                "This will remove the batch and its 3 message associations. "
+                "All saved messages and attachments will be kept."
+            ),
+        )
+        self.assertIsNone(edit_call.kwargs["embed"])
+        confirmation_view = edit_call.kwargs["view"]
+        self.assertIsInstance(
+            confirmation_view,
+            bot.DeleteBatchConfirmationView,
+        )
+        self.assertEqual(confirmation_view.batch_id, 17)
+        self.assertEqual(confirmation_view.owner_user_id, 42)
+        self.assertEqual(confirmation_view.timeout, 600)
+
+    async def test_delete_confirmation_is_owner_scoped(self) -> None:
+        view = bot.DeleteBatchConfirmationView(
+            batch_id=17,
+            owner_user_id=42,
+            title="Architecture",
+        )
+        other_interaction = FakeInteraction(user_id=99)
+
+        self.assertTrue(await view.interaction_check(FakeInteraction()))
+        self.assertFalse(await view.interaction_check(other_interaction))
+        other_interaction.response.send_message.assert_awaited_once_with(
+            "This batch-deletion confirmation belongs to another user.",
+            ephemeral=True,
+        )
+
+    async def test_confirm_delete_reports_removed_associations(self) -> None:
+        view = bot.DeleteBatchConfirmationView(
+            batch_id=17,
+            owner_user_id=42,
+            title="Architecture",
+        )
+        interaction = FakeInteraction()
+        result = SimpleNamespace(associations_removed=1)
+
+        with patch.object(
+            bot,
+            "delete_saved_batch",
+            new=AsyncMock(return_value=result),
+        ) as delete_batch:
+            await view.confirm_deletion.callback(interaction)
+
+        delete_batch.assert_awaited_once_with(
+            batch_id=17,
+            saved_by_user_id="42",
+        )
+        interaction.response.edit_message.assert_awaited_once_with(
+            content=(
+                "Deleted **Architecture** and removed 1 batch association. "
+                "All saved messages and attachments were kept."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    async def test_confirm_delete_handles_stale_confirmation(self) -> None:
+        view = bot.DeleteBatchConfirmationView(
+            batch_id=17,
+            owner_user_id=42,
+            title="Architecture",
+        )
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "delete_saved_batch",
+            new=AsyncMock(return_value=None),
+        ):
+            await view.confirm_deletion.callback(interaction)
+
+        interaction.response.edit_message.assert_awaited_once_with(
+            content=(
+                "The batch no longer exists or is no longer available to "
+                "you. No saved messages were deleted."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    async def test_cancel_delete_changes_no_data(self) -> None:
+        view = bot.DeleteBatchConfirmationView(
+            batch_id=17,
+            owner_user_id=42,
+            title="Architecture",
+        )
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "delete_saved_batch",
+            new=AsyncMock(),
+        ) as delete_batch:
+            await view.cancel_deletion.callback(interaction)
+
+        delete_batch.assert_not_awaited()
+        interaction.response.edit_message.assert_awaited_once_with(
+            content="Batch deletion cancelled. No data was changed.",
+            embed=None,
+            view=None,
         )
 
     async def test_delete_empty_batch_removes_its_summary_panel(self) -> None:

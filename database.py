@@ -74,6 +74,12 @@ class ManualBatchAddResult:
     position: int
 
 
+@dataclass(frozen=True)
+class SavedBatchDeleteResult:
+    batch_id: int
+    associations_removed: int
+
+
 class PendingRangeChangedError(RuntimeError):
     pass
 
@@ -479,6 +485,67 @@ async def delete_empty_saved_batch(
         await database.commit()
 
         return cursor.rowcount == 1
+
+
+async def delete_saved_batch(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+) -> SavedBatchDeleteResult | None:
+    count_associations_query = """
+    SELECT COUNT(batch_message.saved_message_id)
+    FROM saved_batches AS saved_batch
+    LEFT JOIN saved_batch_messages AS batch_message
+      ON batch_message.batch_id = saved_batch.id
+    WHERE saved_batch.id = ?
+      AND saved_batch.saved_by_user_id = ?
+    GROUP BY saved_batch.id;
+    """
+    delete_batch_query = """
+    DELETE FROM saved_batches
+    WHERE id = ?
+      AND saved_by_user_id = ?;
+    """
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        try:
+            await database.execute("BEGIN IMMEDIATE;")
+            cursor = await database.execute(
+                count_associations_query,
+                (
+                    batch_id,
+                    saved_by_user_id,
+                ),
+            )
+            row = await cursor.fetchone()
+
+            if row is None:
+                await database.rollback()
+                return None
+
+            associations_removed = row[0]
+            cursor = await database.execute(
+                delete_batch_query,
+                (
+                    batch_id,
+                    saved_by_user_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise RuntimeError("Failed to delete saved batch")
+
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return SavedBatchDeleteResult(
+        batch_id=batch_id,
+        associations_removed=associations_removed,
+    )
 
 
 async def associate_saved_messages_with_batch(

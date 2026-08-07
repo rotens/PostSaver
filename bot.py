@@ -22,6 +22,7 @@ from database import (
     create_saved_batch_with_message,
     delete_empty_saved_batch,
     delete_pending_range_if_matches,
+    delete_saved_batch,
     delete_saved_message,
     get_ignored_user_ids,
     get_attachments_for_saved_messages,
@@ -1877,6 +1878,117 @@ async def open_saved_batch_detail(
     )
 
 
+def create_saved_batch_delete_confirmation(
+    *,
+    batch_id: int,
+    title: str | None,
+    total_message_count: int,
+) -> str:
+    display_title = get_saved_batch_display_title(
+        batch_id=batch_id,
+        title=title,
+    )
+    escaped_title = discord.utils.escape_markdown(display_title)
+    association_label = (
+        "association" if total_message_count == 1 else "associations"
+    )
+
+    return (
+        f"Delete **{escaped_title}**?\n"
+        f"This will remove the batch and its {total_message_count} "
+        f"message {association_label}. All saved messages and attachments "
+        "will be kept."
+    )
+
+
+class DeleteBatchConfirmationView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        batch_id: int,
+        owner_user_id: int,
+        title: str | None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.batch_id = batch_id
+        self.owner_user_id = owner_user_id
+        self.title = title
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+
+        await interaction.response.send_message(
+            "This batch-deletion confirmation belongs to another user.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Confirm deletion",
+        style=discord.ButtonStyle.danger,
+        custom_id="batch_delete:confirm",
+    )
+    async def confirm_deletion(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = await delete_saved_batch(
+            batch_id=self.batch_id,
+            saved_by_user_id=str(self.owner_user_id),
+        )
+        self.stop()
+
+        if result is None:
+            message = (
+                "The batch no longer exists or is no longer available to "
+                "you. No saved messages were deleted."
+            )
+        else:
+            display_title = get_saved_batch_display_title(
+                batch_id=self.batch_id,
+                title=self.title,
+            )
+            escaped_title = discord.utils.escape_markdown(display_title)
+            association_label = (
+                "association"
+                if result.associations_removed == 1
+                else "associations"
+            )
+            message = (
+                f"Deleted **{escaped_title}** and removed "
+                f"{result.associations_removed} batch {association_label}. "
+                "All saved messages and attachments were kept."
+            )
+
+        await interaction.response.edit_message(
+            content=message,
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="batch_delete:cancel",
+    )
+    async def cancel_deletion(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="Batch deletion cancelled. No data was changed.",
+            embed=None,
+            view=None,
+        )
+
+
 class BatchSummaryView(discord.ui.View):
     def __init__(
         self,
@@ -1892,10 +2004,12 @@ class BatchSummaryView(discord.ui.View):
         self.batch_id = batch_id
         self.owner_user_id = owner_user_id
         self.title = title
+        self.total_message_count = total_message_count
         self.filters = filters
         self.sort = sort
         self.view_batch.disabled = total_message_count == 0
         self.delete_empty_batch.disabled = total_message_count != 0
+        self.delete_batch.disabled = total_message_count == 0
 
     async def interaction_check(
         self,
@@ -1956,6 +2070,32 @@ class BatchSummaryView(discord.ui.View):
             content=message,
             embed=None,
             view=None,
+        )
+
+    @discord.ui.button(
+        label="DELETE BATCH",
+        style=discord.ButtonStyle.danger,
+        custom_id="batch_summary:delete",
+    )
+    async def delete_batch(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.stop()
+        confirmation_view = DeleteBatchConfirmationView(
+            batch_id=self.batch_id,
+            owner_user_id=self.owner_user_id,
+            title=self.title,
+        )
+        await interaction.response.edit_message(
+            content=create_saved_batch_delete_confirmation(
+                batch_id=self.batch_id,
+                title=self.title,
+                total_message_count=self.total_message_count,
+            ),
+            embed=None,
+            view=confirmation_view,
         )
 
 
