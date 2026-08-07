@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
+import database
+
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
 
@@ -80,6 +82,25 @@ def attachment_row(
     }
 
 
+def batch_delete_preview() -> bot.SavedBatchMessageDeletePreview:
+    states = (
+        database.SavedBatchMessageDeleteState(1, False, True, 1),
+        database.SavedBatchMessageDeleteState(2, False, False, 2),
+        database.SavedBatchMessageDeleteState(3, True, False, 3),
+    )
+    return bot.SavedBatchMessageDeletePreview(
+        batch_id=17,
+        title="Architecture",
+        total_message_count=3,
+        shared_message_count=1,
+        older_unshared_message_count=1,
+        newer_unshared_message_count=1,
+        keep_older_attachment_delete_count=2,
+        delete_all_attachment_delete_count=3,
+        message_states=states,
+    )
+
+
 class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
     def create_view(
         self,
@@ -107,9 +128,11 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(populated_view.view_batch.disabled)
         self.assertTrue(populated_view.delete_empty_batch.disabled)
         self.assertFalse(populated_view.delete_batch.disabled)
+        self.assertFalse(populated_view.delete_batch_messages.disabled)
         self.assertTrue(empty_view.view_batch.disabled)
         self.assertFalse(empty_view.delete_empty_batch.disabled)
         self.assertTrue(empty_view.delete_batch.disabled)
+        self.assertTrue(empty_view.delete_batch_messages.disabled)
         self.assertEqual(populated_view.timeout, 600)
 
     async def test_interaction_check_is_owner_scoped(self) -> None:
@@ -263,6 +286,188 @@ class BatchSummaryViewTests(unittest.IsolatedAsyncioTestCase):
         delete_batch.assert_not_awaited()
         interaction.response.edit_message.assert_awaited_once_with(
             content="Batch deletion cancelled. No data was changed.",
+            embed=None,
+            view=None,
+        )
+
+    async def test_delete_messages_button_opens_impact_preview(self) -> None:
+        view = self.create_view()
+        interaction = FakeInteraction()
+        preview = batch_delete_preview()
+
+        with patch.object(
+            bot,
+            "get_saved_batch_message_delete_preview",
+            new=AsyncMock(return_value=preview),
+        ) as get_preview:
+            await view.delete_batch_messages.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with()
+        get_preview.assert_awaited_once_with(
+            batch_id=17,
+            saved_by_user_id="42",
+        )
+        edit_call = interaction.edit_original_response.await_args
+        self.assertIn(
+            "Shared with other batches (always kept): 1",
+            edit_call.kwargs["content"],
+        )
+        self.assertIn("Delete + keep older", edit_call.kwargs["content"])
+        self.assertIsInstance(
+            edit_call.kwargs["view"],
+            bot.DeleteBatchMessagesConfirmationView,
+        )
+
+    async def test_delete_messages_preview_handles_batch_becoming_empty(self) -> None:
+        view = self.create_view()
+        interaction = FakeInteraction()
+        preview = bot.SavedBatchMessageDeletePreview(
+            batch_id=17,
+            title="Architecture",
+            total_message_count=0,
+            shared_message_count=0,
+            older_unshared_message_count=0,
+            newer_unshared_message_count=0,
+            keep_older_attachment_delete_count=0,
+            delete_all_attachment_delete_count=0,
+            message_states=(),
+        )
+
+        with patch.object(
+            bot,
+            "get_saved_batch_message_delete_preview",
+            new=AsyncMock(return_value=preview),
+        ):
+            await view.delete_batch_messages.callback(interaction)
+
+        interaction.edit_original_response.assert_awaited_once_with(
+            content=(
+                "The batch is now empty. Nothing was deleted. Return to "
+                "/batches and use DELETE EMPTY BATCH."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    async def test_destructive_confirmation_is_owner_scoped(self) -> None:
+        view = bot.DeleteBatchMessagesConfirmationView(
+            preview=batch_delete_preview(),
+            owner_user_id=42,
+        )
+        other_interaction = FakeInteraction(user_id=99)
+
+        self.assertTrue(await view.interaction_check(FakeInteraction()))
+        self.assertFalse(await view.interaction_check(other_interaction))
+        other_interaction.response.send_message.assert_awaited_once_with(
+            "This batch-deletion confirmation belongs to another user.",
+            ephemeral=True,
+        )
+
+    async def test_keep_older_confirmation_reports_actual_result(self) -> None:
+        preview = batch_delete_preview()
+        view = bot.DeleteBatchMessagesConfirmationView(
+            preview=preview,
+            owner_user_id=42,
+        )
+        interaction = FakeInteraction()
+        result = SimpleNamespace(
+            associations_removed=3,
+            saved_messages_deleted=1,
+            attachments_deleted=2,
+            shared_messages_kept=1,
+            older_unshared_messages_kept=1,
+        )
+
+        with patch.object(
+            bot,
+            "delete_saved_batch_with_unshared_messages",
+            new=AsyncMock(return_value=result),
+        ) as delete_batch:
+            await view.keep_older.callback(interaction)
+
+        delete_batch.assert_awaited_once_with(
+            batch_id=17,
+            saved_by_user_id="42",
+            mode=bot.UnsharedMessageDeleteMode.KEEP_OLDER,
+            expected_message_states=preview.message_states,
+        )
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once_with(
+            content=(
+                "Deleted the batch and its 3 associations. Deleted 1 saved "
+                "messages and 2 attachments. Kept 1 shared messages and 1 "
+                "older unshared messages."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    async def test_delete_all_confirmation_uses_delete_all_mode(self) -> None:
+        preview = batch_delete_preview()
+        view = bot.DeleteBatchMessagesConfirmationView(
+            preview=preview,
+            owner_user_id=42,
+        )
+        interaction = FakeInteraction()
+        result = SimpleNamespace(
+            associations_removed=3,
+            saved_messages_deleted=2,
+            attachments_deleted=3,
+            shared_messages_kept=1,
+            older_unshared_messages_kept=0,
+        )
+
+        with patch.object(
+            bot,
+            "delete_saved_batch_with_unshared_messages",
+            new=AsyncMock(return_value=result),
+        ) as delete_batch:
+            await view.delete_all_unshared.callback(interaction)
+
+        self.assertEqual(
+            delete_batch.await_args.kwargs["mode"],
+            bot.UnsharedMessageDeleteMode.DELETE_ALL,
+        )
+
+    async def test_changed_preview_aborts_destructive_delete(self) -> None:
+        view = bot.DeleteBatchMessagesConfirmationView(
+            preview=batch_delete_preview(),
+            owner_user_id=42,
+        )
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "delete_saved_batch_with_unshared_messages",
+            new=AsyncMock(side_effect=bot.SavedBatchContentsChangedError()),
+        ):
+            await view.delete_all_unshared.callback(interaction)
+
+        self.assertIn(
+            "Nothing was deleted",
+            interaction.edit_original_response.await_args.kwargs["content"],
+        )
+
+    async def test_cancel_destructive_delete_changes_no_data(self) -> None:
+        view = bot.DeleteBatchMessagesConfirmationView(
+            preview=batch_delete_preview(),
+            owner_user_id=42,
+        )
+        interaction = FakeInteraction()
+
+        with patch.object(
+            bot,
+            "delete_saved_batch_with_unshared_messages",
+            new=AsyncMock(),
+        ) as delete_batch:
+            await view.cancel.callback(interaction)
+
+        delete_batch.assert_not_awaited()
+        interaction.response.edit_message.assert_awaited_once_with(
+            content=(
+                "Batch and saved-message deletion cancelled. "
+                "No data was changed."
+            ),
             embed=None,
             view=None,
         )

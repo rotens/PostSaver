@@ -11,9 +11,12 @@ from database import (
     ManualBatchAddResult,
     MessageToSave,
     PendingRangeChangedError,
+    SavedBatchContentsChangedError,
+    SavedBatchMessageDeletePreview,
     SavedBatchNotFoundError,
     SavedItemSort,
     SavedMessageFilters,
+    UnsharedMessageDeleteMode,
     add_message_to_saved_batch,
     count_saved_batches,
     count_saved_messages_in_batch,
@@ -23,11 +26,13 @@ from database import (
     delete_empty_saved_batch,
     delete_pending_range_if_matches,
     delete_saved_batch,
+    delete_saved_batch_with_unshared_messages,
     delete_saved_message,
     get_ignored_user_ids,
     get_attachments_for_saved_messages,
     get_pending_range,
     get_recent_saved_batches,
+    get_saved_batch_message_delete_preview,
     get_saved_author_autocomplete_choices,
     get_saved_batches,
     get_saved_channel_autocomplete_choices,
@@ -1989,6 +1994,150 @@ class DeleteBatchConfirmationView(discord.ui.View):
         )
 
 
+def create_saved_batch_message_delete_confirmation(
+    preview: SavedBatchMessageDeletePreview,
+) -> str:
+    display_title = get_saved_batch_display_title(
+        batch_id=preview.batch_id,
+        title=preview.title,
+    )
+    escaped_title = discord.utils.escape_markdown(display_title)
+
+    return (
+        f"Delete **{escaped_title}** and some of its saved messages?\n"
+        f"Batch messages: {preview.total_message_count}\n"
+        f"Shared with other batches (always kept): "
+        f"{preview.shared_message_count}\n"
+        f"Unshared, saved before/when this batch was created: "
+        f"{preview.older_unshared_message_count}\n"
+        f"Unshared, saved after this batch was created: "
+        f"{preview.newer_unshared_message_count}\n\n"
+        "**Delete + keep older** deletes the newer unshared messages "
+        f"and {preview.keep_older_attachment_delete_count} attachments.\n"
+        "**Delete all unshared** deletes every unshared message "
+        f"and {preview.delete_all_attachment_delete_count} attachments.\n"
+        "Messages with the same saved timestamp as the batch are treated "
+        "as older. The operation will stop without deleting anything if "
+        "this impact changes before confirmation."
+    )
+
+
+class DeleteBatchMessagesConfirmationView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        preview: SavedBatchMessageDeletePreview,
+        owner_user_id: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.preview = preview
+        self.owner_user_id = owner_user_id
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+
+        await interaction.response.send_message(
+            "This batch-deletion confirmation belongs to another user.",
+            ephemeral=True,
+        )
+        return False
+
+    async def delete_with_mode(
+        self,
+        interaction: discord.Interaction,
+        *,
+        mode: UnsharedMessageDeleteMode,
+    ) -> None:
+        await interaction.response.defer()
+
+        try:
+            result = await delete_saved_batch_with_unshared_messages(
+                batch_id=self.preview.batch_id,
+                saved_by_user_id=str(self.owner_user_id),
+                mode=mode,
+                expected_message_states=self.preview.message_states,
+            )
+        except SavedBatchContentsChangedError:
+            message = (
+                "The batch contents, sharing state, or attachment impact "
+                "changed after this preview. Nothing was deleted. Open "
+                "the deletion preview again to review the current impact."
+            )
+        else:
+            if result is None:
+                message = (
+                    "The batch no longer exists or is no longer available "
+                    "to you. Nothing was deleted."
+                )
+            else:
+                message = (
+                    f"Deleted the batch and its "
+                    f"{result.associations_removed} associations. Deleted "
+                    f"{result.saved_messages_deleted} saved messages and "
+                    f"{result.attachments_deleted} attachments. Kept "
+                    f"{result.shared_messages_kept} shared messages and "
+                    f"{result.older_unshared_messages_kept} older unshared "
+                    "messages."
+                )
+        self.stop()
+        await interaction.edit_original_response(
+            content=message,
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Delete + keep older",
+        style=discord.ButtonStyle.danger,
+        custom_id="batch_delete_messages:keep_older",
+    )
+    async def keep_older(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.delete_with_mode(
+            interaction,
+            mode=UnsharedMessageDeleteMode.KEEP_OLDER,
+        )
+
+    @discord.ui.button(
+        label="Delete all unshared",
+        style=discord.ButtonStyle.danger,
+        custom_id="batch_delete_messages:all_unshared",
+    )
+    async def delete_all_unshared(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.delete_with_mode(
+            interaction,
+            mode=UnsharedMessageDeleteMode.DELETE_ALL,
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="batch_delete_messages:cancel",
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="Batch and saved-message deletion cancelled. No data was changed.",
+            embed=None,
+            view=None,
+        )
+
+
 class BatchSummaryView(discord.ui.View):
     def __init__(
         self,
@@ -2010,6 +2159,7 @@ class BatchSummaryView(discord.ui.View):
         self.view_batch.disabled = total_message_count == 0
         self.delete_empty_batch.disabled = total_message_count != 0
         self.delete_batch.disabled = total_message_count == 0
+        self.delete_batch_messages.disabled = total_message_count == 0
 
     async def interaction_check(
         self,
@@ -2094,6 +2244,56 @@ class BatchSummaryView(discord.ui.View):
                 title=self.title,
                 total_message_count=self.total_message_count,
             ),
+            embed=None,
+            view=confirmation_view,
+        )
+
+    @discord.ui.button(
+        label="DELETE BATCH + MESSAGES",
+        style=discord.ButtonStyle.danger,
+        custom_id="batch_summary:delete_messages",
+    )
+    async def delete_batch_messages(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer()
+        preview = await get_saved_batch_message_delete_preview(
+            batch_id=self.batch_id,
+            saved_by_user_id=str(self.owner_user_id),
+        )
+
+        if preview is None:
+            self.stop()
+            await interaction.edit_original_response(
+                content=(
+                    "The batch no longer exists or is no longer available "
+                    "to you. Nothing was deleted."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
+
+        if preview.total_message_count == 0:
+            self.stop()
+            await interaction.edit_original_response(
+                content=(
+                    "The batch is now empty. Nothing was deleted. Return to "
+                    "/batches and use DELETE EMPTY BATCH."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
+
+        confirmation_view = DeleteBatchMessagesConfirmationView(
+            preview=preview,
+            owner_user_id=self.owner_user_id,
+        )
+        await interaction.edit_original_response(
+            content=create_saved_batch_message_delete_confirmation(preview),
             embed=None,
             view=confirmation_view,
         )

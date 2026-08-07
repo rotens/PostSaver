@@ -80,11 +80,51 @@ class SavedBatchDeleteResult:
     associations_removed: int
 
 
+class UnsharedMessageDeleteMode(StrEnum):
+    KEEP_OLDER = "KEEP_OLDER"
+    DELETE_ALL = "DELETE_ALL"
+
+
+@dataclass(frozen=True)
+class SavedBatchMessageDeleteState:
+    saved_message_id: int
+    is_shared: bool
+    is_older_or_equal: bool
+    attachment_count: int
+
+
+@dataclass(frozen=True)
+class SavedBatchMessageDeletePreview:
+    batch_id: int
+    title: str | None
+    total_message_count: int
+    shared_message_count: int
+    older_unshared_message_count: int
+    newer_unshared_message_count: int
+    keep_older_attachment_delete_count: int
+    delete_all_attachment_delete_count: int
+    message_states: tuple[SavedBatchMessageDeleteState, ...]
+
+
+@dataclass(frozen=True)
+class SavedBatchMessageDeleteResult:
+    batch_id: int
+    associations_removed: int
+    saved_messages_deleted: int
+    attachments_deleted: int
+    shared_messages_kept: int
+    older_unshared_messages_kept: int
+
+
 class PendingRangeChangedError(RuntimeError):
     pass
 
 
 class SavedBatchNotFoundError(LookupError):
+    pass
+
+
+class SavedBatchContentsChangedError(RuntimeError):
     pass
 
 
@@ -545,6 +585,199 @@ async def delete_saved_batch(
     return SavedBatchDeleteResult(
         batch_id=batch_id,
         associations_removed=associations_removed,
+    )
+
+
+async def _get_saved_batch_message_delete_preview(
+    database: aiosqlite.Connection,
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+) -> SavedBatchMessageDeletePreview | None:
+    batch_cursor = await database.execute(
+        """
+        SELECT title, created_at
+        FROM saved_batches
+        WHERE id = ?
+          AND saved_by_user_id = ?;
+        """,
+        (batch_id, saved_by_user_id),
+    )
+    batch_row = await batch_cursor.fetchone()
+
+    if batch_row is None:
+        return None
+
+    title, batch_created_at = batch_row
+    message_cursor = await database.execute(
+        """
+        SELECT
+            saved_message.id,
+            EXISTS (
+                SELECT 1
+                FROM saved_batch_messages AS other_batch_message
+                WHERE other_batch_message.saved_message_id = saved_message.id
+                  AND other_batch_message.batch_id != ?
+            ) AS is_shared,
+            saved_message.saved_at <= ? AS is_older_or_equal,
+            (
+                SELECT COUNT(*)
+                FROM saved_message_attachments AS attachment
+                WHERE attachment.saved_message_id = saved_message.id
+            ) AS attachment_count
+        FROM saved_batch_messages AS batch_message
+        JOIN saved_messages AS saved_message
+          ON saved_message.id = batch_message.saved_message_id
+        WHERE batch_message.batch_id = ?
+          AND saved_message.saved_by_user_id = ?
+        ORDER BY saved_message.id;
+        """,
+        (
+            batch_id,
+            batch_created_at,
+            batch_id,
+            saved_by_user_id,
+        ),
+    )
+    rows = await message_cursor.fetchall()
+    message_states = tuple(
+        SavedBatchMessageDeleteState(
+            saved_message_id=row[0],
+            is_shared=bool(row[1]),
+            is_older_or_equal=bool(row[2]),
+            attachment_count=row[3],
+        )
+        for row in rows
+    )
+    shared_states = tuple(state for state in message_states if state.is_shared)
+    older_unshared_states = tuple(
+        state
+        for state in message_states
+        if not state.is_shared and state.is_older_or_equal
+    )
+    newer_unshared_states = tuple(
+        state
+        for state in message_states
+        if not state.is_shared and not state.is_older_or_equal
+    )
+
+    return SavedBatchMessageDeletePreview(
+        batch_id=batch_id,
+        title=title,
+        total_message_count=len(message_states),
+        shared_message_count=len(shared_states),
+        older_unshared_message_count=len(older_unshared_states),
+        newer_unshared_message_count=len(newer_unshared_states),
+        keep_older_attachment_delete_count=sum(
+            state.attachment_count for state in newer_unshared_states
+        ),
+        delete_all_attachment_delete_count=sum(
+            state.attachment_count
+            for state in (*older_unshared_states, *newer_unshared_states)
+        ),
+        message_states=message_states,
+    )
+
+
+async def get_saved_batch_message_delete_preview(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+) -> SavedBatchMessageDeletePreview | None:
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        return await _get_saved_batch_message_delete_preview(
+            database,
+            batch_id=batch_id,
+            saved_by_user_id=saved_by_user_id,
+        )
+
+
+async def delete_saved_batch_with_unshared_messages(
+    *,
+    batch_id: int,
+    saved_by_user_id: str,
+    mode: UnsharedMessageDeleteMode,
+    expected_message_states: tuple[SavedBatchMessageDeleteState, ...],
+) -> SavedBatchMessageDeleteResult | None:
+    try:
+        validated_mode = UnsharedMessageDeleteMode(mode)
+    except ValueError as error:
+        raise ValueError(f"Unsupported unshared-message delete mode: {mode}") from error
+
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        try:
+            await database.execute("BEGIN IMMEDIATE;")
+            preview = await _get_saved_batch_message_delete_preview(
+                database,
+                batch_id=batch_id,
+                saved_by_user_id=saved_by_user_id,
+            )
+
+            if preview is None:
+                await database.rollback()
+                return None
+
+            if preview.message_states != expected_message_states:
+                raise SavedBatchContentsChangedError(
+                    "The batch contents or deletion impact changed"
+                )
+
+            states_to_delete = tuple(
+                state
+                for state in preview.message_states
+                if not state.is_shared
+                and (
+                    validated_mode is UnsharedMessageDeleteMode.DELETE_ALL
+                    or not state.is_older_or_equal
+                )
+            )
+            for state in states_to_delete:
+                cursor = await database.execute(
+                    """
+                    DELETE FROM saved_messages
+                    WHERE id = ?
+                      AND saved_by_user_id = ?;
+                    """,
+                    (state.saved_message_id, saved_by_user_id),
+                )
+                if cursor.rowcount != 1:
+                    raise SavedBatchContentsChangedError(
+                        "A saved message changed during batch deletion"
+                    )
+
+            cursor = await database.execute(
+                """
+                DELETE FROM saved_batches
+                WHERE id = ?
+                  AND saved_by_user_id = ?;
+                """,
+                (batch_id, saved_by_user_id),
+            )
+            if cursor.rowcount != 1:
+                raise SavedBatchContentsChangedError(
+                    "The batch changed during deletion"
+                )
+
+            await database.commit()
+        except Exception:
+            await database.rollback()
+            raise
+
+    return SavedBatchMessageDeleteResult(
+        batch_id=batch_id,
+        associations_removed=preview.total_message_count,
+        saved_messages_deleted=len(states_to_delete),
+        attachments_deleted=sum(
+            state.attachment_count for state in states_to_delete
+        ),
+        shared_messages_kept=preview.shared_message_count,
+        older_unshared_messages_kept=(
+            preview.older_unshared_message_count
+            if validated_mode is UnsharedMessageDeleteMode.KEEP_OLDER
+            else 0
+        ),
     )
 
 

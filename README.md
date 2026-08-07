@@ -170,8 +170,24 @@ Nonempty summaries provide `DELETE BATCH`. It opens an owner-scoped
 confirmation showing the batch title and total message count. Confirming
 deletes the batch and its message associations in one transaction, reports the
 actual number of associations removed, and preserves every saved-message and
-attachment record. Cancelling changes no data. Batch details remain read-only
-and do not provide rename, association removal, or batch-level status controls.
+attachment record.
+
+`DELETE BATCH + MESSAGES` is the destructive alternative. Its confirmation
+preview separates the batch's messages into three groups: messages shared with
+another batch, unshared messages saved before or when the batch was created,
+and unshared messages saved afterward. Shared messages are always preserved.
+The user can either keep the older unshared messages and delete only the newer
+ones, or delete every unshared message. "Older" is based on the local
+`saved_at` timestamp, not the original Discord message date; equal timestamps
+are conservatively treated as older. Attachments belonging to deleted messages
+are removed by the database's foreign-key cascade.
+
+The preview includes the message and attachment impact of both choices. The
+database rechecks the exact membership, sharing state, age classification, and
+attachment counts in the deletion transaction. If anything changed after the
+preview, deletion stops without modifying data and the user must open a fresh
+preview. Cancelling also changes no data. Batch details remain read-only and do
+not provide rename, association removal, or batch-level status controls.
 
 ### Attachments
 
@@ -411,7 +427,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 174 tests covering:
+The current suite contains 188 tests covering:
 
 - individual-message storage, duplicate handling, deterministic date/length
   sorting, ordering, and pagination;
@@ -443,6 +459,9 @@ The current suite contains 174 tests covering:
   button states, and stale-panel responses;
 - confirmed nonempty-batch deletion, association counts, saved-record and
   attachment preservation, ownership, cancellation, and stale confirmations;
+- destructive batch deletion previews, older/newer classification, attachment
+  impact, shared-message preservation, both unshared-message deletion modes,
+  ownership, cancellation, and atomic stale-preview protection;
 - `/batches` filter parsing and autocomplete reuse, active-filter summaries,
   empty states, page validation, per-summary views, filtered detail opening,
   filter-preserving navigation, ownership, attachment rendering, and embed
