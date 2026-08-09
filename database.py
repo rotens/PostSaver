@@ -1,4 +1,5 @@
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -7,6 +8,31 @@ import aiosqlite
 
 
 DATABASE_PATH = Path("data/reading_manager.db")
+
+
+@asynccontextmanager
+async def _connect_database(
+    *,
+    rows: bool = False,
+) -> AsyncIterator[aiosqlite.Connection]:
+    async with aiosqlite.connect(DATABASE_PATH) as database:
+        await database.execute("PRAGMA foreign_keys = ON;")
+
+        if rows:
+            database.row_factory = aiosqlite.Row
+
+        yield database
+
+
+@asynccontextmanager
+async def _rollback_on_error(
+    database: aiosqlite.Connection,
+) -> AsyncIterator[None]:
+    try:
+        yield
+    except Exception:
+        await database.rollback()
+        raise
 
 
 @dataclass(frozen=True)
@@ -265,8 +291,7 @@ async def _add_missing_saved_message_location_columns(
 async def initialize_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
+    async with _connect_database() as database:
         await database.execute(CREATE_SAVED_MESSAGES_TABLE)
         await _add_missing_saved_message_location_columns(database)
         await database.execute(CREATE_SAVED_MESSAGE_ATTACHMENTS_TABLE)
@@ -379,7 +404,7 @@ async def set_pending_range_start(
         created_at = CURRENT_TIMESTAMP;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         await database.execute(
             query,
             (
@@ -407,9 +432,7 @@ async def get_pending_range(
     WHERE saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
-
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(
             query,
             (saved_by_user_id,),
@@ -427,7 +450,7 @@ async def delete_pending_range(
     WHERE saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (saved_by_user_id,),
@@ -448,7 +471,7 @@ async def delete_pending_range_if_matches(
       AND start_message_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -479,7 +502,7 @@ async def create_saved_batch(
     if not normalized_title:
         normalized_title = None
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -513,8 +536,7 @@ async def delete_empty_saved_batch(
       );
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -547,11 +569,9 @@ async def delete_saved_batch(
       AND saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        try:
-            await database.execute("BEGIN IMMEDIATE;")
+    async with _connect_database() as database:
+        await database.execute("BEGIN IMMEDIATE;")
+        async with _rollback_on_error(database):
             cursor = await database.execute(
                 count_associations_query,
                 (
@@ -578,9 +598,6 @@ async def delete_saved_batch(
                 raise RuntimeError("Failed to delete saved batch")
 
             await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
 
     return SavedBatchDeleteResult(
         batch_id=batch_id,
@@ -684,7 +701,7 @@ async def get_saved_batch_message_delete_preview(
     batch_id: int,
     saved_by_user_id: str,
 ) -> SavedBatchMessageDeletePreview | None:
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         return await _get_saved_batch_message_delete_preview(
             database,
             batch_id=batch_id,
@@ -704,11 +721,9 @@ async def delete_saved_batch_with_unshared_messages(
     except ValueError as error:
         raise ValueError(f"Unsupported unshared-message delete mode: {mode}") from error
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        try:
-            await database.execute("BEGIN IMMEDIATE;")
+    async with _connect_database() as database:
+        await database.execute("BEGIN IMMEDIATE;")
+        async with _rollback_on_error(database):
             preview = await _get_saved_batch_message_delete_preview(
                 database,
                 batch_id=batch_id,
@@ -761,9 +776,6 @@ async def delete_saved_batch_with_unshared_messages(
                 )
 
             await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
 
     return SavedBatchMessageDeleteResult(
         batch_id=batch_id,
@@ -813,9 +825,7 @@ async def associate_saved_messages_with_batch(
 
     associated_count = 0
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
+    async with _connect_database() as database:
         for saved_message_id, position in message_positions:
             cursor = await database.execute(
                 query,
@@ -859,8 +869,7 @@ async def get_recent_saved_batches(
     LIMIT ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(
             query,
             (
@@ -1013,11 +1022,9 @@ async def add_message_to_saved_batch(
       AND saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        try:
-            await database.execute("BEGIN IMMEDIATE;")
+    async with _connect_database() as database:
+        await database.execute("BEGIN IMMEDIATE;")
+        async with _rollback_on_error(database):
             cursor = await database.execute(
                 find_owned_batch_query,
                 (
@@ -1046,9 +1053,6 @@ async def add_message_to_saved_batch(
                 )
             )
             await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
 
     return ManualBatchAddResult(
         batch_id=batch_id,
@@ -1079,11 +1083,9 @@ async def create_saved_batch_with_message(
     VALUES (?, ?);
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        try:
-            await database.execute("BEGIN IMMEDIATE;")
+    async with _connect_database() as database:
+        await database.execute("BEGIN IMMEDIATE;")
+        async with _rollback_on_error(database):
             cursor = await database.execute(
                 create_batch_query,
                 (
@@ -1111,9 +1113,6 @@ async def create_saved_batch_with_message(
                 )
             )
             await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
 
     return ManualBatchAddResult(
         batch_id=batch_id,
@@ -1153,7 +1152,7 @@ async def count_saved_batches(
         WHERE {where_clause};
         """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(query, values)
         row = await cursor.fetchone()
 
@@ -1365,9 +1364,7 @@ async def get_saved_batches(
     LIMIT ? OFFSET ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
-
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(
             query,
             (
@@ -1405,7 +1402,7 @@ async def count_saved_messages_in_batch(
       AND {where_clause};
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -1456,9 +1453,7 @@ async def get_saved_messages_in_batch(
     LIMIT ? OFFSET ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
-
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(
             query,
             (
@@ -1555,12 +1550,9 @@ async def save_message_range_as_batch(
 
     saved_count = 0
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        try:
-            await database.execute("BEGIN;")
-
+    async with _connect_database() as database:
+        await database.execute("BEGIN;")
+        async with _rollback_on_error(database):
             cursor = await database.execute(
                 check_pending_range_query,
                 (
@@ -1646,9 +1638,6 @@ async def save_message_range_as_batch(
                 )
 
             await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
 
     return RangeSaveResult(
         batch_id=batch_id,
@@ -1670,7 +1659,7 @@ async def ignore_user(
     VALUES (?, ?);
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -1694,7 +1683,7 @@ async def unignore_user(
       AND ignored_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -1716,7 +1705,7 @@ async def unignore_all_users(
     WHERE saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (saved_by_user_id,),
@@ -1738,7 +1727,7 @@ async def is_user_ignored(
       AND ignored_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -1761,7 +1750,7 @@ async def get_ignored_user_ids(
     WHERE saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (saved_by_user_id,),
@@ -1827,11 +1816,9 @@ async def save_unread_message(
         message_created_at,
     )
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
-
-        try:
-            await database.execute("BEGIN;")
+    async with _connect_database() as database:
+        await database.execute("BEGIN;")
+        async with _rollback_on_error(database):
             cursor = await database.execute(query, values)
             was_inserted = cursor.rowcount == 1
 
@@ -1855,9 +1842,6 @@ async def save_unread_message(
                 )
 
             await database.commit()
-        except Exception:
-            await database.rollback()
-            raise
 
     return was_inserted
 
@@ -1977,9 +1961,7 @@ async def get_saved_messages(
     values.append(limit)
     values.append(offset)
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
-
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(query, values)
         rows = await cursor.fetchall()
 
@@ -2026,9 +2008,7 @@ async def get_attachments_for_saved_messages(
         for saved_message_id in unique_message_ids
     }
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
-
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(query, values)
         rows = await cursor.fetchall()
 
@@ -2054,7 +2034,7 @@ async def count_saved_messages(
     WHERE {where_clause};
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(query, values)
         row = await cursor.fetchone()
 
@@ -2101,8 +2081,7 @@ async def get_saved_author_autocomplete_choices(
     """
     pattern = _autocomplete_like_pattern(current)
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(
             query,
             (
@@ -2168,8 +2147,7 @@ async def get_saved_channel_autocomplete_choices(
     pattern = _autocomplete_like_pattern(current)
     values.extend((pattern, pattern, pattern, limit))
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(query, values)
 
         return await cursor.fetchall()
@@ -2208,8 +2186,7 @@ async def get_saved_guild_autocomplete_choices(
     """
     pattern = _autocomplete_like_pattern(current)
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        database.row_factory = aiosqlite.Row
+    async with _connect_database(rows=True) as database:
         cursor = await database.execute(
             query,
             (
@@ -2242,7 +2219,7 @@ async def update_saved_message_status(
       AND saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
@@ -2267,8 +2244,7 @@ async def delete_saved_message(
       AND saved_by_user_id = ?;
     """
 
-    async with aiosqlite.connect(DATABASE_PATH) as database:
-        await database.execute("PRAGMA foreign_keys = ON;")
+    async with _connect_database() as database:
         cursor = await database.execute(
             query,
             (
