@@ -274,6 +274,11 @@ From the repository root:
 python bot.py
 ```
 
+`bot.py` loads `.env`, validates `DISCORD_TOKEN`, and connects to Discord only
+when it is executed as the application entry point. Importing `bot` from tests
+or other Python modules registers its commands and helpers without starting a
+Discord connection.
+
 Running from the repository root is important because the database path is
 relative:
 
@@ -427,7 +432,7 @@ Run the complete suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The current suite contains 188 tests covering:
+The current suite contains 190 tests covering:
 
 - individual-message storage, duplicate handling, deterministic date/length
   sorting, ordering, and pagination;
@@ -437,6 +442,7 @@ The current suite contains 188 tests covering:
 - saved-message status validation, ownership, and deletion;
 - ignored-user creation, removal, reset, self-ignore, and owner isolation;
 - Discord command responses and metadata passed to the database layer;
+- import-safe bot startup, environment loading, and missing-token validation;
 - additive location-column migration, single-message and range location
   capture, query propagation, readable location rendering, and old-record
   fallbacks;

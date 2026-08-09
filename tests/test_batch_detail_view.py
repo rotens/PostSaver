@@ -1,17 +1,11 @@
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import discord
 
+import bot
 import database
-
-
-os.environ.setdefault("DISCORD_TOKEN", "test-token")
-
-with patch.object(discord.Client, "run"):
-    import bot
 
 
 class FakeInteraction:

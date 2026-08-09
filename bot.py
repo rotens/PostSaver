@@ -51,10 +51,6 @@ from database import (
     update_saved_message_status,
 )
 
-
-load_dotenv()
-
-
 SAVED_MESSAGES_PAGE_SIZE = 5
 SAVED_BATCHES_PAGE_SIZE = 5
 BATCH_DETAIL_PAGE_SIZE = 5
@@ -2760,9 +2756,15 @@ async def saved_guild_autocomplete(
     ]
 
 
-token = os.getenv("DISCORD_TOKEN")
+def main() -> None:
+    load_dotenv()
+    token = os.getenv("DISCORD_TOKEN")
 
-if not token:
-    raise RuntimeError("Missing DISCORD_TOKEN variable")
+    if not token:
+        raise RuntimeError("Missing DISCORD_TOKEN variable")
 
-bot.run(token)
+    bot.run(token)
+
+
+if __name__ == "__main__":
+    main()

@@ -6,11 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-
-os.environ.setdefault("DISCORD_TOKEN", "test-token")
-
-with patch.object(discord.Client, "run"):
-    import bot
+import bot
 
 
 class FakeAuthor:
@@ -79,6 +75,38 @@ class FakeInteraction:
             send_message=AsyncMock(),
             send_modal=AsyncMock(),
         )
+
+
+class BotStartupTests(unittest.TestCase):
+    def test_main_loads_environment_and_runs_bot(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"DISCORD_TOKEN": "test-token"},
+                clear=True,
+            ),
+            patch.object(bot, "load_dotenv") as load_environment,
+            patch.object(bot.bot, "run") as run_bot,
+        ):
+            bot.main()
+
+        load_environment.assert_called_once_with()
+        run_bot.assert_called_once_with("test-token")
+
+    def test_main_rejects_missing_token_before_running_bot(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(bot, "load_dotenv") as load_environment,
+            patch.object(bot.bot, "run") as run_bot,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Missing DISCORD_TOKEN variable",
+            ):
+                bot.main()
+
+        load_environment.assert_called_once_with()
+        run_bot.assert_not_called()
 
 
 class CommandTreeConfigurationTests(unittest.TestCase):

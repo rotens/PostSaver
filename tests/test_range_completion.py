@@ -1,4 +1,3 @@
-import os
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -6,12 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-
-os.environ.setdefault("DISCORD_TOKEN", "test-token")
-
-with patch.object(discord.Client, "run"):
-    import bot
-
+import bot
 from database import RangeSaveResult
 
 
