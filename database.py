@@ -382,6 +382,109 @@ async def _insert_saved_message_attachments(
     return inserted_count
 
 
+async def _save_or_get_saved_message(
+    database: aiosqlite.Connection,
+    *,
+    saved_by_user_id: str,
+    message: MessageToSave,
+) -> tuple[int, bool]:
+    save_message_query = """
+    INSERT OR IGNORE INTO saved_messages (
+        saved_by_user_id,
+        message_id,
+        guild_id,
+        guild_name,
+        channel_id,
+        channel_name,
+        author_id,
+        author_name,
+        content,
+        jump_url,
+        message_created_at,
+        status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
+    """
+    get_saved_message_query = """
+    SELECT id
+    FROM saved_messages
+    WHERE saved_by_user_id = ?
+      AND message_id = ?;
+    """
+
+    cursor = await database.execute(
+        save_message_query,
+        (
+            saved_by_user_id,
+            message.message_id,
+            message.guild_id,
+            message.guild_name,
+            message.channel_id,
+            message.channel_name,
+            message.author_id,
+            message.author_name,
+            message.content,
+            message.jump_url,
+            message.message_created_at,
+        ),
+    )
+    message_was_saved = cursor.rowcount == 1
+
+    cursor = await database.execute(
+        get_saved_message_query,
+        (
+            saved_by_user_id,
+            message.message_id,
+        ),
+    )
+    row = await cursor.fetchone()
+
+    if row is None:
+        raise RuntimeError("Failed to find saved message record")
+
+    saved_message_id = row[0]
+    await _insert_saved_message_attachments(
+        database,
+        saved_message_id=saved_message_id,
+        attachments=message.attachments,
+    )
+
+    return saved_message_id, message_was_saved
+
+
+async def _create_saved_batch_record(
+    database: aiosqlite.Connection,
+    *,
+    saved_by_user_id: str,
+    title: str | None,
+) -> int:
+    query = """
+    INSERT INTO saved_batches (
+        saved_by_user_id,
+        title
+    )
+    VALUES (?, ?);
+    """
+    normalized_title = title.strip() if title else None
+
+    if not normalized_title:
+        normalized_title = None
+
+    cursor = await database.execute(
+        query,
+        (
+            saved_by_user_id,
+            normalized_title,
+        ),
+    )
+    batch_id = cursor.lastrowid
+
+    if batch_id is None:
+        raise RuntimeError("Failed to create saved batch")
+
+    return batch_id
+
+
 async def set_pending_range_start(
     *,
     saved_by_user_id: str,
@@ -489,33 +592,13 @@ async def create_saved_batch(
     saved_by_user_id: str,
     title: str | None = None,
 ) -> int:
-    query = """
-    INSERT INTO saved_batches (
-        saved_by_user_id,
-        title
-    )
-    VALUES (?, ?);
-    """
-
-    normalized_title = title.strip() if title else None
-
-    if not normalized_title:
-        normalized_title = None
-
     async with _connect_database() as database:
-        cursor = await database.execute(
-            query,
-            (
-                saved_by_user_id,
-                normalized_title,
-            ),
+        batch_id = await _create_saved_batch_record(
+            database,
+            saved_by_user_id=saved_by_user_id,
+            title=title,
         )
         await database.commit()
-
-        batch_id = cursor.lastrowid
-
-        if batch_id is None:
-            raise RuntimeError("Failed to create saved batch")
 
         return batch_id
 
@@ -881,76 +964,6 @@ async def get_recent_saved_batches(
         return await cursor.fetchall()
 
 
-async def _save_message_for_manual_batch(
-    database: aiosqlite.Connection,
-    *,
-    saved_by_user_id: str,
-    message: MessageToSave,
-) -> tuple[int, bool]:
-    save_message_query = """
-    INSERT OR IGNORE INTO saved_messages (
-        saved_by_user_id,
-        message_id,
-        guild_id,
-        guild_name,
-        channel_id,
-        channel_name,
-        author_id,
-        author_name,
-        content,
-        jump_url,
-        message_created_at,
-        status
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
-    """
-    get_saved_message_query = """
-    SELECT id
-    FROM saved_messages
-    WHERE saved_by_user_id = ?
-      AND message_id = ?;
-    """
-
-    cursor = await database.execute(
-        save_message_query,
-        (
-            saved_by_user_id,
-            message.message_id,
-            message.guild_id,
-            message.guild_name,
-            message.channel_id,
-            message.channel_name,
-            message.author_id,
-            message.author_name,
-            message.content,
-            message.jump_url,
-            message.message_created_at,
-        ),
-    )
-    message_was_saved = cursor.rowcount == 1
-
-    cursor = await database.execute(
-        get_saved_message_query,
-        (
-            saved_by_user_id,
-            message.message_id,
-        ),
-    )
-    row = await cursor.fetchone()
-
-    if row is None:
-        raise RuntimeError("Failed to find saved message record")
-
-    saved_message_id = row[0]
-    await _insert_saved_message_attachments(
-        database,
-        saved_message_id=saved_message_id,
-        attachments=message.attachments,
-    )
-
-    return saved_message_id, message_was_saved
-
-
 async def _append_saved_message_to_batch(
     database: aiosqlite.Connection,
     *,
@@ -1039,7 +1052,7 @@ async def add_message_to_saved_batch(
                 )
 
             saved_message_id, message_was_saved = (
-                await _save_message_for_manual_batch(
+                await _save_or_get_saved_message(
                     database,
                     saved_by_user_id=saved_by_user_id,
                     message=message,
@@ -1070,36 +1083,18 @@ async def create_saved_batch_with_message(
     message: MessageToSave,
 ) -> ManualBatchAddResult:
     _validate_attachments(message.attachments)
-    normalized_title = title.strip() if title else None
-
-    if not normalized_title:
-        normalized_title = None
-
-    create_batch_query = """
-    INSERT INTO saved_batches (
-        saved_by_user_id,
-        title
-    )
-    VALUES (?, ?);
-    """
 
     async with _connect_database() as database:
         await database.execute("BEGIN IMMEDIATE;")
         async with _rollback_on_error(database):
-            cursor = await database.execute(
-                create_batch_query,
-                (
-                    saved_by_user_id,
-                    normalized_title,
-                ),
+            batch_id = await _create_saved_batch_record(
+                database,
+                saved_by_user_id=saved_by_user_id,
+                title=title,
             )
-            batch_id = cursor.lastrowid
-
-            if batch_id is None:
-                raise RuntimeError("Failed to create saved batch")
 
             saved_message_id, message_was_saved = (
-                await _save_message_for_manual_batch(
+                await _save_or_get_saved_message(
                     database,
                     saved_by_user_id=saved_by_user_id,
                     message=message,
@@ -1488,49 +1483,11 @@ async def save_message_range_as_batch(
     for message in messages:
         _validate_attachments(message.attachments)
 
-    normalized_title = title.strip() if title else None
-
-    if not normalized_title:
-        normalized_title = None
-
     check_pending_range_query = """
     SELECT 1
     FROM pending_ranges
     WHERE saved_by_user_id = ?
       AND start_message_id = ?;
-    """
-
-    create_batch_query = """
-    INSERT INTO saved_batches (
-        saved_by_user_id,
-        title
-    )
-    VALUES (?, ?);
-    """
-
-    save_message_query = """
-    INSERT OR IGNORE INTO saved_messages (
-        saved_by_user_id,
-        message_id,
-        guild_id,
-        guild_name,
-        channel_id,
-        channel_name,
-        author_id,
-        author_name,
-        content,
-        jump_url,
-        message_created_at,
-        status
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
-    """
-
-    get_saved_message_id_query = """
-    SELECT id
-    FROM saved_messages
-    WHERE saved_by_user_id = ?
-      AND message_id = ?;
     """
 
     associate_message_query = """
@@ -1566,60 +1523,27 @@ async def save_message_range_as_batch(
                     "Pending range no longer matches the selected start"
                 )
 
-            cursor = await database.execute(
-                create_batch_query,
-                (
-                    saved_by_user_id,
-                    normalized_title,
-                ),
+            batch_id = await _create_saved_batch_record(
+                database,
+                saved_by_user_id=saved_by_user_id,
+                title=title,
             )
-            batch_id = cursor.lastrowid
-
-            if batch_id is None:
-                raise RuntimeError("Failed to create saved batch")
 
             for message in messages:
-                cursor = await database.execute(
-                    save_message_query,
-                    (
-                        saved_by_user_id,
-                        message.message_id,
-                        message.guild_id,
-                        message.guild_name,
-                        message.channel_id,
-                        message.channel_name,
-                        message.author_id,
-                        message.author_name,
-                        message.content,
-                        message.jump_url,
-                        message.message_created_at,
-                    ),
+                saved_message_id, message_was_saved = (
+                    await _save_or_get_saved_message(
+                        database,
+                        saved_by_user_id=saved_by_user_id,
+                        message=message,
+                    )
                 )
-                saved_count += cursor.rowcount
-
-                cursor = await database.execute(
-                    get_saved_message_id_query,
-                    (
-                        saved_by_user_id,
-                        message.message_id,
-                    ),
-                )
-                row = await cursor.fetchone()
-
-                if row is None:
-                    raise RuntimeError("Failed to find saved message record")
-
-                await _insert_saved_message_attachments(
-                    database,
-                    saved_message_id=row[0],
-                    attachments=message.attachments,
-                )
+                saved_count += int(message_was_saved)
 
                 await database.execute(
                     associate_message_query,
                     (
                         batch_id,
-                        row[0],
+                        saved_message_id,
                         message.position,
                     ),
                 )
@@ -1776,70 +1700,29 @@ async def save_unread_message(
     attachments: Sequence[AttachmentToSave] = (),
 ) -> bool:
     _validate_attachments(attachments)
-
-    query = """
-    INSERT OR IGNORE INTO saved_messages (
-        saved_by_user_id,
-        message_id,
-        guild_id,
-        guild_name,
-        channel_id,
-        channel_name,
-        author_id,
-        author_name,
-        content,
-        jump_url,
-        message_created_at,
-        status
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNREAD');
-    """
-
-    get_saved_message_id_query = """
-    SELECT id
-    FROM saved_messages
-    WHERE saved_by_user_id = ?
-      AND message_id = ?;
-    """
-
-    values = (
-        saved_by_user_id,
-        message_id,
-        guild_id,
-        guild_name,
-        channel_id,
-        channel_name,
-        author_id,
-        author_name,
-        content,
-        jump_url,
-        message_created_at,
+    message = MessageToSave(
+        message_id=message_id,
+        guild_id=guild_id,
+        guild_name=guild_name,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        author_id=author_id,
+        author_name=author_name,
+        content=content,
+        jump_url=jump_url,
+        message_created_at=message_created_at,
+        position=0,
+        attachments=tuple(attachments),
     )
 
     async with _connect_database() as database:
         await database.execute("BEGIN;")
         async with _rollback_on_error(database):
-            cursor = await database.execute(query, values)
-            was_inserted = cursor.rowcount == 1
-
-            if attachments:
-                cursor = await database.execute(
-                    get_saved_message_id_query,
-                    (
-                        saved_by_user_id,
-                        message_id,
-                    ),
-                )
-                row = await cursor.fetchone()
-
-                if row is None:
-                    raise RuntimeError("Failed to find saved message record")
-
-                await _insert_saved_message_attachments(
-                    database,
-                    saved_message_id=row[0],
-                    attachments=attachments,
-                )
+            _, was_inserted = await _save_or_get_saved_message(
+                database,
+                saved_by_user_id=saved_by_user_id,
+                message=message,
+            )
 
             await database.commit()
 
