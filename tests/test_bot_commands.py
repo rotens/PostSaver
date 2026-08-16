@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import discord
 
 import bot
+from database import AttachmentToSave
 
 
 class FakeAuthor:
@@ -207,7 +208,7 @@ class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
             jump_url="https://discord.test/100",
             message_created_at="2026-07-23T00:00:00+00:00",
             attachments=(
-                bot.AttachmentToSave(
+                AttachmentToSave(
                     attachment_id="501",
                     filename="diagram.png",
                     url="https://cdn.discord.test/501",
@@ -219,7 +220,7 @@ class SingleMessageCommandTests(unittest.IsolatedAsyncioTestCase):
                     height=720,
                     position=0,
                 ),
-                bot.AttachmentToSave(
+                AttachmentToSave(
                     attachment_id="502",
                     filename="notes.pdf",
                     url="https://cdn.discord.test/502",

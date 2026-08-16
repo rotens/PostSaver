@@ -486,7 +486,10 @@ Manual Discord testing has also confirmed the current range-saving workflow.
 
 ```text
 bot.py
-    Discord client, commands, context menus, views, modal, and range workflow.
+    Discord client, commands, context menus, views, modal, and orchestration.
+
+reading_manager/message_capture.py
+    Discord message-history retrieval and conversion to database-ready values.
 
 database.py
     SQLite schema and asynchronous database functions.

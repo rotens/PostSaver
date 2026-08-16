@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, patch
 import discord
 
 import bot
-from database import RangeSaveResult
+from database import AttachmentToSave, RangeSaveResult
+from reading_manager import message_capture
 
 
 class FakeAuthor:
@@ -111,7 +112,7 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage(100, channel=channel, author_id=1)
 
         with self.assertRaisesRegex(ValueError, "at least one"):
-            await bot.get_messages_in_range(
+            await message_capture.get_messages_in_range(
                 message,
                 message,
                 max_messages=0,
@@ -124,12 +125,12 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
         end = FakeMessage(300, channel=channel, author_id=3)
         channel.history_messages = [middle]
 
-        messages = await bot.get_messages_in_range(start, end)
+        messages = await message_capture.get_messages_in_range(start, end)
 
         self.assertEqual(messages, [start, middle, end])
         self.assertEqual(
             channel.history_arguments["limit"],
-            bot.MAX_RANGE_MESSAGES_TO_SCAN - 1,
+            message_capture.MAX_RANGE_MESSAGES_TO_SCAN - 1,
         )
         self.assertEqual(channel.history_arguments["after"].id, start.id)
         self.assertEqual(channel.history_arguments["before"].id, end.id)
@@ -142,7 +143,7 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
         newer = FakeMessage(300, channel=channel, author_id=3)
         channel.history_messages = [middle]
 
-        messages = await bot.get_messages_in_range(newer, older)
+        messages = await message_capture.get_messages_in_range(newer, older)
 
         self.assertEqual(messages, [older, middle, newer])
         self.assertEqual(channel.history_arguments["after"].id, older.id)
@@ -152,7 +153,10 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
         channel = FakeChannel(20)
         message = FakeMessage(100, channel=channel, author_id=1)
 
-        messages = await bot.get_messages_in_range(message, message)
+        messages = await message_capture.get_messages_in_range(
+            message,
+            message,
+        )
 
         self.assertEqual(messages, [message])
         self.assertIsNone(channel.history_arguments)
@@ -167,8 +171,8 @@ class MessageHistoryRangeTests(unittest.IsolatedAsyncioTestCase):
         end = FakeMessage(400, channel=channel, author_id=4)
         channel.history_messages = [middle_1, middle_2]
 
-        with self.assertRaises(bot.RangeTooLargeError):
-            await bot.get_messages_in_range(
+        with self.assertRaises(message_capture.RangeTooLargeError):
+            await message_capture.get_messages_in_range(
                 start,
                 end,
                 max_messages=3,
@@ -421,7 +425,7 @@ class CompleteMessageRangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             prepared_messages[0].attachments,
             (
-                bot.AttachmentToSave(
+                AttachmentToSave(
                     attachment_id="501",
                     filename="start.png",
                     url="https://cdn.discord.test/501",
